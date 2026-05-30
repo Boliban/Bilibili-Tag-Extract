@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Bilibili Tag Extract": {
+      "commandName": "Project",
+      "commandLineArgs": "-f"
+    }
+  }
+}
