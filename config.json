@@ -117,6 +117,8 @@
     "泰拉瑞亚": "游戏",
     "饥荒": "游戏"
   },
-  "exclude_months": [ "2026-01", "2026-02", "2026-03"],
-  "author_min_count": 3
+  "exclude_months": [ "2026-01", "2026-02", "2026-03" ],
+  "author_min_count": 3,
+  "input_folder": "./input",
+  "output_folder": "./output"
 }
