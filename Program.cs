@@ -5,7 +5,6 @@ using System.Text.RegularExpressions;
 
 namespace VideoTagProcessor
 {
-    // 原始JSON数据项
     public class VideoItem
     {
         [JsonPropertyName("id")] public long Id { get; set; }
@@ -45,6 +44,29 @@ namespace VideoTagProcessor
         public int AuthorMinCount { get; set; } = 5;
         public string InputFolder { get; set; } = "";
         public string OutputFolder { get; set; } = "";
+        public ClassificationConfig Classification { get; set; } = new();
+    }
+
+    public class ClassificationConfig
+    {
+        public string Provider { get; set; } = "ollama";
+
+        [JsonPropertyName("ollama_url")]
+        public string OllamaUrl { get; set; } = "http://localhost:11434";
+
+        [JsonPropertyName("ollama_model")]
+        public string OllamaModel { get; set; } = "deepseek-r1:1.5b";
+
+        [JsonPropertyName("deepseek_api_key")]    // ← 精确匹配你的 JSON
+        public string DeepSeekApiKey { get; set; } = "";
+
+        [JsonPropertyName("deepseek_model")]      // ← 精确匹配
+        public string DeepSeekModel { get; set; } = "deepseek-chat";
+
+        public List<string> Categories { get; set; } = new();
+
+        [JsonPropertyName("batch_size")]
+        public int BatchSize { get; set; } = 10;
     }
 
     public class CsvRow
@@ -78,7 +100,6 @@ namespace VideoTagProcessor
             => writer.WriteStringValue(value);
     }
 
-    // 合并历史记录格式
     public class MergeHistory
     {
         public List<string> MergedFiles { get; set; } = new();
@@ -87,7 +108,7 @@ namespace VideoTagProcessor
     class Program
     {
         static readonly HttpClient httpClient = new HttpClient();
-        static string configFile = "config.json";   // 配置文件路径，默认为当前目录
+        static string configFile = "config.json";
 
         static async Task Main(string[] args)
         {
@@ -100,7 +121,6 @@ namespace VideoTagProcessor
                 await CommandLineMode(args);
         }
 
-        // ==================== 交互模式 ====================
         static async Task InteractiveMode()
         {
             var config = LoadConfig(configFile);
@@ -108,40 +128,28 @@ namespace VideoTagProcessor
             while (true)
             {
                 Console.WriteLine("\n请选择要执行的操作：");
-                Console.WriteLine("1 - 统计标签/作者并输出 CSV（使用最新历史文件）");
-                Console.WriteLine("2 - 获取视频详细标签并输出 JSON（使用最新历史文件）");
+                Console.WriteLine("1 - 统计标签/作者并输出 CSV（使用合并文件）");
+                Console.WriteLine("2 - 获取视频详细标签并输出 JSON（最新历史文件）");
                 Console.WriteLine("3 - 执行 1 + 2");
-                Console.WriteLine("4 - 自动合并所有新历史文件（增量，不获取标签）");
-                Console.WriteLine("5 - 自动合并所有新历史文件 + 智能获取详细标签");
-                Console.Write("请输入数字 (1/2/3/4/5)：");
+                Console.WriteLine("4 - 自动合并新历史文件（增量，不获取标签）");
+                Console.WriteLine("5 - 自动合并 + 智能获取详细标签");
+                Console.WriteLine("6 - 智能分类视频（需 merged_history_with_tags.json）");
+                Console.Write("请输入数字 (1-6)：");
                 string input = Console.ReadLine()?.Trim();
 
                 switch (input)
                 {
-                    case "1":
-                        await RunStatisticsForLatest(config);
-                        return;
-                    case "2":
-                        await RunFetchTagsForLatest(config);
-                        return;
-                    case "3":
-                        await RunFetchTagsForLatest(config);
-                        await RunStatisticsForLatest(config);
-                        return;
-                    case "4":
-                        await AutoMergeFiles(config, applyFetchTags: false);
-                        return;
-                    case "5":
-                        await AutoMergeFiles(config, applyFetchTags: true);
-                        return;
-                    default:
-                        Console.WriteLine("输入无效，请输入 1～5。");
-                        break;
+                    case "1": await RunStatisticsForLatest(config); return;
+                    case "2": await RunFetchTagsForLatest(config); return;
+                    case "3": await RunFetchTagsForLatest(config); await RunStatisticsForLatest(config); return;
+                    case "4": await AutoMergeFiles(config, applyFetchTags: false); return;
+                    case "5": await AutoMergeFiles(config, applyFetchTags: true); return;
+                    case "6": await RunClassification(config); return;
+                    default: Console.WriteLine("输入无效。"); break;
                 }
             }
         }
 
-        // ==================== 命令行模式（保留兼容） ====================
         static async Task CommandLineMode(string[] args)
         {
             string inputJson = null;
@@ -152,63 +160,35 @@ namespace VideoTagProcessor
             {
                 switch (args[i])
                 {
-                    case "-i": case "--input":
-                        if (i + 1 < args.Length) inputJson = args[++i];
-                        break;
-                    case "-c": case "--config":
-                        if (i + 1 < args.Length) configFile = args[++i];
-                        break;
-                    case "-o": case "--output":
-                        if (i + 1 < args.Length) outputCsv = args[++i];
-                        break;
-                    case "-f": case "--fetch-tags":
-                        fetchTags = true;
-                        break;
-                    default:
-                        Console.WriteLine($"未知参数: {args[i]}");
-                        return;
+                    case "-i": case "--input": if (i + 1 < args.Length) inputJson = args[++i]; break;
+                    case "-c": case "--config": if (i + 1 < args.Length) configFile = args[++i]; break;
+                    case "-o": case "--output": if (i + 1 < args.Length) outputCsv = args[++i]; break;
+                    case "-f": case "--fetch-tags": fetchTags = true; break;
                 }
             }
 
             var config = LoadConfig(configFile);
-
             if (!string.IsNullOrEmpty(inputJson))
             {
                 var items = LoadAndFilterItems(inputJson);
-                if (fetchTags)
-                {
-                    string fetchOut = GetOutputPath(config, "input_with_tags.json");
-                    await FetchAllTags(items, fetchOut);
-                }
-                if (outputCsv != null)
-                {
-                    await RunStatistics(items, config, outputCsv);
-                }
-                else
-                {
-                    await RunStatistics(items, config);
-                }
-            }
-            else
-            {
-                Console.WriteLine("命令行模式需要指定输入文件 (-i)。");
+                if (fetchTags) await FetchAllTags(items, GetOutputPath(config, "input_with_tags.json"));
+                await RunStatistics(items, config, outputCsv);
             }
         }
 
-        // ==================== 模式 1/2/3 辅助 ====================
+        // ==================== 模式 1/2/3 ====================
         static async Task RunStatisticsForLatest(Config config)
         {
             string mergedPath = GetOutputPath(config, "merged_history.json");
             if (!File.Exists(mergedPath))
             {
-                Console.WriteLine($"合并文件不存在: {mergedPath}，回退到最新历史文件。");
-                var latestFile = GetLatestHistoryFile(config);
-                if (latestFile == null) return;
-                var items = LoadAndFilterItems(latestFile);
+                Console.WriteLine("合并文件不存在，尝试使用最新历史文件。");
+                var latest = GetLatestHistoryFile(config);
+                if (latest == null) return;
+                var items = LoadAndFilterItems(latest);
                 await RunStatistics(items, config);
                 return;
             }
-
             Console.WriteLine($"使用合并文件: {mergedPath}");
             var mergedItems = LoadAndFilterItems(mergedPath);
             await RunStatistics(mergedItems, config);
@@ -219,97 +199,74 @@ namespace VideoTagProcessor
             var latestFile = GetLatestHistoryFile(config);
             if (latestFile == null) return;
             var items = LoadAndFilterItems(latestFile);
-            string fetchOut = GetOutputPath(config, "input_with_tags.json");
-            await FetchAllTags(items, fetchOut);
+            await FetchAllTags(items, GetOutputPath(config, "input_with_tags.json"));
         }
 
         static string GetLatestHistoryFile(Config config)
         {
             var files = ScanHistoryFiles(config);
-            if (files.Count == 0)
-            {
-                Console.WriteLine("输入文件夹中没有找到 bilibili-history-*.json 文件。");
-                return null;
-            }
+            if (files.Count == 0) { Console.WriteLine("没有历史文件。"); return null; }
             var latest = files.Last();
-            Console.WriteLine($"自动选择最新文件: {Path.GetFileName(latest)}");
+            Console.WriteLine($"最新文件: {Path.GetFileName(latest)}");
             return latest;
         }
 
-        // ==================== 自动合并（模式 4/5） ====================
+        // ==================== 自动合并 4/5 ====================
         static async Task AutoMergeFiles(Config config, bool applyFetchTags)
         {
             var allFiles = ScanHistoryFiles(config);
-            if (allFiles.Count == 0)
-            {
-                Console.WriteLine("输入文件夹中没有历史文件可供合并。");
-                return;
-            }
+            if (allFiles.Count == 0) { Console.WriteLine("无历史文件。"); return; }
 
             string mergeHistoryPath = GetOutputPath(config, "merge_history.json");
             var history = LoadMergeHistory(mergeHistoryPath);
             var newFiles = allFiles.Where(f => !history.MergedFiles.Contains(f)).ToList();
 
-            string outputFileBase = GetOutputPath(config, "merged_history.json");
-            string outputFileWithTags = GetOutputPath(config, "merged_history_with_tags.json");
+            string outputBase = GetOutputPath(config, "merged_history.json");
+            string outputWithTags = GetOutputPath(config, "merged_history_with_tags.json");
 
-            // 如果没有新文件
             if (newFiles.Count == 0)
             {
                 if (applyFetchTags)
                 {
-                    string sourceFile = File.Exists(outputFileWithTags) ? outputFileWithTags : outputFileBase;
-                    if (!File.Exists(sourceFile))
-                    {
-                        Console.WriteLine("没有可用的合并文件，无法补充标签。");
-                        return;
-                    }
-                    var existingItems = LoadVideoItems(sourceFile);
-                    if (existingItems == null || existingItems.Count == 0)
-                    {
-                        Console.WriteLine("合并文件为空，无法补充标签。");
-                        return;
-                    }
-                    Console.WriteLine("所有历史文件均已合并过，检查现有合并文件中缺失标签的视频...");
-                    await FetchMissingTags(existingItems, outputFileWithTags);
+                    string source = File.Exists(outputWithTags) ? outputWithTags : outputBase;
+                    if (!File.Exists(source)) { Console.WriteLine("无合并文件。"); return; }
+                    var items = LoadVideoItems(source);
+                    if (items == null || items.Count == 0) { Console.WriteLine("合并文件为空。"); return; }
+                    Console.WriteLine("补充缺失标签...");
+                    await FetchMissingTags(items, outputWithTags);
                 }
-                else
-                {
-                    Console.WriteLine("所有历史文件均已合并过，无需操作。");
-                }
+                else Console.WriteLine("所有文件均已合并。");
                 return;
             }
 
-            Console.WriteLine($"发现 {newFiles.Count} 个新文件待合并：");
-            foreach (var f in newFiles) Console.WriteLine($"  {Path.GetFileName(f)}");
+            Console.WriteLine($"新文件 {newFiles.Count} 个：");
+            newFiles.ForEach(f => Console.WriteLine($"  {Path.GetFileName(f)}"));
 
-            // 优先使用带标签的合并文件
             List<VideoItem> baseItems = null;
-            if (File.Exists(outputFileWithTags))
+            if (File.Exists(outputWithTags))
             {
-                baseItems = LoadVideoItems(outputFileWithTags);
-                Console.WriteLine($"已加载带标签的合并文件: {outputFileWithTags} ({baseItems?.Count ?? 0} 条)");
+                baseItems = LoadVideoItems(outputWithTags);
+                Console.WriteLine($"已加载带标签合并文件 ({baseItems?.Count ?? 0} 条)");
             }
-            else if (File.Exists(outputFileBase))
+            else if (File.Exists(outputBase))
             {
-                baseItems = LoadVideoItems(outputFileBase);
-                Console.WriteLine($"已加载合并文件（无标签）: {outputFileBase} ({baseItems?.Count ?? 0} 条)");
+                baseItems = LoadVideoItems(outputBase);
+                Console.WriteLine($"已加载合并文件 ({baseItems?.Count ?? 0} 条)");
             }
 
-            var mergedItems = MergeWithBase(baseItems, newFiles);
-            mergedItems = mergedItems.OrderByDescending(item => item.ViewAt).ToList();
+            var merged = MergeWithBase(baseItems, newFiles);
+            merged = merged.OrderByDescending(it => it.ViewAt).ToList();
 
-            SaveItemsToJson(mergedItems, outputFileBase);
-            Console.WriteLine($"合并完成，共 {mergedItems.Count} 条记录，已输出到 {outputFileBase}");
+            SaveItemsToJson(merged, outputBase);
+            Console.WriteLine($"合并完成，共 {merged.Count} 条，保存至 {outputBase}");
 
-            // 更新历史
-            foreach (var f in newFiles) history.MergedFiles.Add(f);
+            newFiles.ForEach(f => history.MergedFiles.Add(f));
             SaveMergeHistory(mergeHistoryPath, history);
 
             if (applyFetchTags)
             {
-                Console.WriteLine("为合并后的视频补充详细标签（跳过已有标签的视频）...");
-                await FetchMissingTags(mergedItems, outputFileWithTags);
+                Console.WriteLine("补充标签（跳过已有）...");
+                await FetchMissingTags(merged, outputWithTags);
             }
         }
 
@@ -321,289 +278,218 @@ namespace VideoTagProcessor
 
             foreach (var path in newFilePaths)
             {
-                var jsonText = File.ReadAllText(path);
-                var items = JsonSerializer.Deserialize<List<VideoItem>>(jsonText, options);
-                if (items == null || items.Count == 0) continue;
-
-                var newItems = items.Where(it => it.ViewAt > maxViewAt).ToList();
-                if (newItems.Count > 0)
+                var items = JsonSerializer.Deserialize<List<VideoItem>>(File.ReadAllText(path), options);
+                if (items == null) continue;
+                var newOnes = items.Where(it => it.ViewAt > maxViewAt).ToList();
+                if (newOnes.Count > 0)
                 {
-                    result.AddRange(newItems);
-                    maxViewAt = Math.Max(maxViewAt, newItems.Max(it => it.ViewAt));
+                    result.AddRange(newOnes);
+                    maxViewAt = Math.Max(maxViewAt, newOnes.Max(it => it.ViewAt));
                 }
             }
             return result;
         }
 
-        // ==================== 核心统计 ====================
+        // ==================== 统计 ====================
         static async Task RunStatistics(List<VideoItem> items, Config config, string overrideCsvPath = null)
         {
-            var itemsWithDate = items.Select(item =>
+            var withDate = items.Select(it =>
             {
-                DateTime date = DateTimeOffset.FromUnixTimeSeconds(item.ViewAt).LocalDateTime;
-                return new { item.TagName, item.AuthorName, YearMonth = date.ToString("yyyy-MM") };
+                var dt = DateTimeOffset.FromUnixTimeSeconds(it.ViewAt).LocalDateTime;
+                return new { it.TagName, it.AuthorName, YearMonth = dt.ToString("yyyy-MM") };
             }).Where(x => !config.ExcludeMonths.Contains(x.YearMonth)).ToList();
 
-            // 检查未映射标签
-            var unmappedTags = new HashSet<string>(
-                itemsWithDate.Select(x => x.TagName)
-                             .Where(t => !config.MergeMapping.ContainsKey(t))
-                             .Distinct()
-            );
-            if (unmappedTags.Count > 0)
+            var unmapped = withDate.Select(x => x.TagName).Distinct()
+                .Where(t => !config.MergeMapping.ContainsKey(t)).ToList();
+            if (unmapped.Count > 0)
             {
-                Console.WriteLine("错误：以下标签在 merge_mapping 中没有对应映射，请更新 config.json：");
-                foreach (var t in unmappedTags.OrderBy(t => t)) Console.WriteLine($"  - {t}");
+                Console.WriteLine("未映射标签：");
+                unmapped.ForEach(t => Console.WriteLine($"  - {t}"));
                 return;
             }
 
-            var mappedItems = itemsWithDate.Select(x => new
+            var mapped = withDate.Select(x => new
             {
-                YearMonth = x.YearMonth,
+                x.YearMonth,
                 Tag = config.MergeMapping[x.TagName],
                 Author = x.AuthorName
             }).ToList();
 
-            var allMonths = mappedItems.Select(x => x.YearMonth).Distinct().OrderBy(m => m).ToList();
+            var months = mapped.Select(x => x.YearMonth).Distinct().OrderBy(m => m).ToList();
 
-            // 标签矩阵
-            var tagMatrix = mappedItems
-                .GroupBy(x => new { x.Tag, x.YearMonth })
+            var tagMat = mapped.GroupBy(x => new { x.Tag, x.YearMonth })
                 .GroupBy(g => g.Key.Tag)
                 .ToDictionary(g => g.Key, g => g.ToDictionary(x => x.Key.YearMonth, x => x.Count()));
 
-            var sortedTags = tagMatrix
-                .OrderByDescending(kvp => kvp.Value.Values.Sum())
-                .ThenBy(kvp => kvp.Key)
-                .Select(kvp => kvp.Key)
-                .ToList();
+            var sortedTags = tagMat.OrderByDescending(kv => kv.Value.Values.Sum()).Select(kv => kv.Key).ToList();
+            string tagCsv = overrideCsvPath ?? GetOutputPath(config, "output.csv");
+            WriteTagMatrixCsv(tagCsv, sortedTags, months, tagMat);
 
-            string csvPath = overrideCsvPath ?? GetOutputPath(config, "output.csv");
-            WriteTagMatrixCsv(csvPath, sortedTags, allMonths, tagMatrix);
-            Console.WriteLine($"标签统计已写入: {csvPath}");
-
-            // 作者矩阵
-            var authorMatrix = mappedItems
-                .GroupBy(x => new { x.Author, x.YearMonth })
+            var authorMat = mapped.GroupBy(x => new { x.Author, x.YearMonth })
                 .GroupBy(g => g.Key.Author)
                 .ToDictionary(g => g.Key, g => g.ToDictionary(x => x.Key.YearMonth, x => x.Count()));
+            var filteredAuthors = authorMat
+                .Where(kv => kv.Value.Values.Sum() >= config.AuthorMinCount)
+                .OrderByDescending(kv => kv.Value.Values.Sum())
+                .Select(kv => kv.Key).ToList();
 
-            var filteredAuthors = authorMatrix
-                .Where(kvp => kvp.Value.Values.Sum() >= config.AuthorMinCount)
-                .OrderByDescending(kvp => kvp.Value.Values.Sum())
-                .ThenBy(kvp => kvp.Key)
-                .Select(kvp => kvp.Key)
-                .ToList();
+            string authorCsv = GetOutputPath(config, "output_authors.csv");
+            WriteAuthorMatrixCsv(authorCsv, filteredAuthors, months, authorMat);
 
-            string authorsCsv = GetOutputPath(config, "output_authors.csv");
-            WriteAuthorMatrixCsv(authorsCsv, filteredAuthors, allMonths, authorMatrix);
-            Console.WriteLine($"作者统计已写入: {authorsCsv}");
+            Console.WriteLine($"标签统计 → {tagCsv}");
+            Console.WriteLine($"作者统计 → {authorCsv}");
         }
 
         static void WriteTagMatrixCsv(string path, List<string> tags, List<string> months,
                                       Dictionary<string, Dictionary<string, int>> matrix)
         {
-            using var writer = new StreamWriter(path, false, Encoding.UTF8);
-            var header = new List<string> { "Tag" };
-            header.AddRange(months.Select(EscapeCsvField));
-            writer.WriteLine(string.Join(",", header));
-
+            using var w = new StreamWriter(path, false, Encoding.UTF8);
+            w.WriteLine("Tag," + string.Join(",", months.Select(EscapeCsvField)));
             foreach (var tag in tags)
             {
                 var row = new List<string> { EscapeCsvField(tag) };
-                var tagData = matrix.TryGetValue(tag, out var dict) ? dict : new Dictionary<string, int>();
-                foreach (var month in months)
-                    row.Add(tagData.TryGetValue(month, out int c) ? c.ToString() : "0");
-                writer.WriteLine(string.Join(",", row));
+                var d = matrix.TryGetValue(tag, out var dict) ? dict : new Dictionary<string, int>();
+                foreach (var m in months) row.Add(d.TryGetValue(m, out int c) ? c.ToString() : "0");
+                w.WriteLine(string.Join(",", row));
             }
         }
 
         static void WriteAuthorMatrixCsv(string path, List<string> authors, List<string> months,
                                          Dictionary<string, Dictionary<string, int>> matrix)
         {
-            using var writer = new StreamWriter(path, false, Encoding.UTF8);
-            var header = new List<string> { "Author" };
-            header.AddRange(months.Select(EscapeCsvField));
-            writer.WriteLine(string.Join(",", header));
-
-            foreach (var author in authors)
+            using var w = new StreamWriter(path, false, Encoding.UTF8);
+            w.WriteLine("Author," + string.Join(",", months.Select(EscapeCsvField)));
+            foreach (var a in authors)
             {
-                var row = new List<string> { EscapeCsvField(author) };
-                var authorData = matrix.TryGetValue(author, out var dict) ? dict : new Dictionary<string, int>();
-                foreach (var month in months)
-                    row.Add(authorData.TryGetValue(month, out int c) ? c.ToString() : "0");
-                writer.WriteLine(string.Join(",", row));
+                var row = new List<string> { EscapeCsvField(a) };
+                var d = matrix.TryGetValue(a, out var dict) ? dict : new Dictionary<string, int>();
+                foreach (var m in months) row.Add(d.TryGetValue(m, out int c) ? c.ToString() : "0");
+                w.WriteLine(string.Join(",", row));
             }
         }
 
         // ==================== 标签抓取 ====================
         static async Task FetchAllTags(List<VideoItem> items, string outputPath)
-        {
-            await FetchTagsInternal(items, outputPath, onlyMissing: false);
-        }
-
+            => await FetchTagsInternal(items, outputPath, onlyMissing: false);
         static async Task FetchMissingTags(List<VideoItem> items, string outputPath)
-        {
-            await FetchTagsInternal(items, outputPath, onlyMissing: true);
-        }
+            => await FetchTagsInternal(items, outputPath, onlyMissing: true);
 
         static async Task FetchTagsInternal(List<VideoItem> items, string outputPath, bool onlyMissing)
         {
             var toFetch = onlyMissing
-                ? items.Where(item =>
-                    (item.DetailTags == null || item.DetailTags.Count == 0) &&
-                    item.Business == "archive")
-                .ToList()
-                : items.Where(item => item.Business == "archive").ToList();
+                ? items.Where(it => (it.DetailTags == null || it.DetailTags.Count == 0) && it.Business == "archive").ToList()
+                : items.Where(it => it.Business == "archive").ToList();
 
             if (toFetch.Count == 0)
             {
-                Console.WriteLine("所有 archive 视频均已包含详细标签，无需获取。");
+                Console.WriteLine("所有 archive 视频已含标签。");
                 SaveItemsToJson(items, outputPath);
                 return;
             }
-
-            Console.WriteLine($"需要获取标签的 archive 视频：{toFetch.Count} / {items.Count} 条");
-            int successCount = 0;
+            Console.WriteLine($"需获取标签：{toFetch.Count} / {items.Count} 条");
+            int ok = 0;
             var rng = new Random();
             for (int i = 0; i < toFetch.Count; i++)
             {
                 var item = toFetch[i];
-                Console.Write($"\r处理 {i + 1}/{toFetch.Count} (BV:{item.Bvid})");
+                Console.Write($"\r{i + 1}/{toFetch.Count} (BV:{item.Bvid})");
                 try
                 {
                     item.DetailTags = await FetchVideoTags(item.Bvid);
-                    successCount++;
+                    ok++;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"\n获取 BV:{item.Bvid} 标签失败: {ex.Message}");
+                    Console.WriteLine($"\n获取失败 BV:{item.Bvid}: {ex.Message}");
                     item.DetailTags = null;
                 }
                 await Task.Delay(rng.Next(150, 400));
             }
-            Console.WriteLine($"\n标签抓取完成，成功 {successCount}/{toFetch.Count} 条。");
+            Console.WriteLine($"\n成功 {ok}/{toFetch.Count}");
             SaveItemsToJson(items, outputPath);
         }
 
         static async Task<List<BiliTag>> FetchVideoTags(string bvid)
         {
             string url = $"https://api.bilibili.com/x/tag/archive/tags?bvid={bvid}";
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("Referer", "https://www.bilibili.com/");
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Add("Referer", "https://www.bilibili.com/");
+            var resp = await httpClient.SendAsync(req);
+            resp.EnsureSuccessStatusCode();
 
-            var response = await httpClient.SendAsync(request);
-            response.EnsureSuccessStatusCode();
-
-            using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+            using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync());
             var root = doc.RootElement;
-
-            if (root.GetProperty("code").GetInt32() != 0)
-                return new List<BiliTag>();
-
+            if (root.GetProperty("code").GetInt32() != 0) return new List<BiliTag>();
             var data = root.GetProperty("data");
-            if (data.ValueKind == JsonValueKind.Array && data.GetArrayLength() == 0)
-                return new List<BiliTag>();
-
+            if (data.ValueKind == JsonValueKind.Array && data.GetArrayLength() == 0) return new List<BiliTag>();
             return JsonSerializer.Deserialize<List<BiliTag>>(data.GetRawText()) ?? new List<BiliTag>();
         }
 
         static void SaveItemsToJson(List<VideoItem> items, string path)
         {
-            var options = new JsonSerializerOptions
-            {
-                WriteIndented = true,
-                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-            };
-            string json = JsonSerializer.Serialize(items, options);
-            File.WriteAllText(path, json);
-            Console.WriteLine($"已输出文件: {path}");
+            var opts = new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+            File.WriteAllText(path, JsonSerializer.Serialize(items, opts));
+            Console.WriteLine($"已输出: {path}");
         }
 
-        // ==================== 文件扫描与历史管理 ====================
+        // ==================== 文件扫描 ====================
         static List<string> ScanHistoryFiles(Config config)
         {
             string dir = string.IsNullOrEmpty(config.InputFolder) ? "." : config.InputFolder;
             if (!Directory.Exists(dir)) return new List<string>();
-
             var files = Directory.GetFiles(dir, "bilibili-history-*.json")
-                .Where(f => Regex.IsMatch(Path.GetFileName(f),
-                    @"^bilibili-history-(\d{4}-\d{2}-\d{2})( \(\d+\))?\.json$"))
+                .Where(f => Regex.IsMatch(Path.GetFileName(f), @"^bilibili-history-(\d{4}-\d{2}-\d{2})( \(\d+\))?\.json$"))
                 .ToList();
-
             files.Sort((a, b) =>
             {
                 var da = ExtractDateAndNumber(a);
                 var db = ExtractDateAndNumber(b);
-                int dateCmp = da.Date.CompareTo(db.Date);
-                if (dateCmp != 0) return dateCmp;
+                int cmp = da.Date.CompareTo(db.Date);
+                if (cmp != 0) return cmp;
                 return da.Number.CompareTo(db.Number);
             });
             return files;
         }
 
-        static (DateTime Date, int Number) ExtractDateAndNumber(string filePath)
+        static (DateTime Date, int Number) ExtractDateAndNumber(string path)
         {
-            var name = Path.GetFileNameWithoutExtension(filePath);
-            var match = Regex.Match(name, @"^bilibili-history-(\d{4}-\d{2}-\d{2})( \((\d+)\))?$");
-            if (!match.Success)
-                throw new FormatException($"文件名格式错误: {name}");
-
-            var date = DateTime.ParseExact(match.Groups[1].Value, "yyyy-MM-dd", null);
-            int number = 0;
-            if (match.Groups[3].Success)
-                number = int.Parse(match.Groups[3].Value);
-            return (date, number);
+            var name = Path.GetFileNameWithoutExtension(path);
+            var m = Regex.Match(name, @"^bilibili-history-(\d{4}-\d{2}-\d{2})( \((\d+)\))?$");
+            if (!m.Success) throw new FormatException($"文件名格式错误: {name}");
+            var dt = DateTime.ParseExact(m.Groups[1].Value, "yyyy-MM-dd", null);
+            int num = 0;
+            if (m.Groups[3].Success) num = int.Parse(m.Groups[3].Value);
+            return (dt, num);
         }
 
         static MergeHistory LoadMergeHistory(string path)
         {
             if (!File.Exists(path)) return new MergeHistory();
-            try
-            {
-                string json = File.ReadAllText(path);
-                return JsonSerializer.Deserialize<MergeHistory>(json) ?? new MergeHistory();
-            }
+            try { return JsonSerializer.Deserialize<MergeHistory>(File.ReadAllText(path)) ?? new MergeHistory(); }
             catch { return new MergeHistory(); }
         }
-
-        static void SaveMergeHistory(string path, MergeHistory history)
+        static void SaveMergeHistory(string path, MergeHistory h)
         {
-            var options = new JsonSerializerOptions { WriteIndented = true };
-            string json = JsonSerializer.Serialize(history, options);
-            File.WriteAllText(path, json);
+            var opts = new JsonSerializerOptions { WriteIndented = true };
+            File.WriteAllText(path, JsonSerializer.Serialize(h, opts));
         }
 
         // ==================== 基础 IO ====================
-        static List<VideoItem> LoadAndFilterItems(string filePath)
+        static List<VideoItem> LoadAndFilterItems(string path)
         {
-            if (!File.Exists(filePath))
-            {
-                Console.WriteLine($"文件不存在: {filePath}");
-                Environment.Exit(1);
-            }
-
-            var jsonText = File.ReadAllText(filePath);
-            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-            var items = JsonSerializer.Deserialize<List<VideoItem>>(jsonText, options);
-            items = items?.Where(item =>
-                !string.IsNullOrEmpty(item.TagName) &&
-                !string.IsNullOrEmpty(item.AuthorName)
-            ).ToList();
-
-            if (items == null || items.Count == 0)
-            {
-                Console.WriteLine("输入数据为空（或过滤后无有效数据）。");
-                Environment.Exit(1);
-            }
+            if (!File.Exists(path)) { Console.WriteLine($"文件不存在: {path}"); Environment.Exit(1); }
+            var json = File.ReadAllText(path);
+            var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var items = JsonSerializer.Deserialize<List<VideoItem>>(json, opts);
+            items = items?.Where(it => !string.IsNullOrEmpty(it.TagName) && !string.IsNullOrEmpty(it.AuthorName)).ToList();
+            if (items == null || items.Count == 0) { Console.WriteLine("无有效数据。"); Environment.Exit(1); }
             return items;
         }
 
-        static List<VideoItem> ?LoadVideoItems(string filePath)
+        static List<VideoItem> LoadVideoItems(string path)
         {
-            if (!File.Exists(filePath)) return null;
-            var jsonText = File.ReadAllText(filePath);
-            return JsonSerializer.Deserialize<List<VideoItem>>(jsonText,
+            if (!File.Exists(path)) return null;
+            return JsonSerializer.Deserialize<List<VideoItem>>(File.ReadAllText(path),
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
 
@@ -615,37 +501,261 @@ namespace VideoTagProcessor
                 return new Config();
             }
 
-            var json = File.ReadAllText(path);
+            string json = File.ReadAllText(path);
             var config = new Config();
+
             using var doc = JsonDocument.Parse(json);
 
             if (doc.RootElement.TryGetProperty("merge_mapping", out var mergeEl))
                 config.MergeMapping = JsonSerializer.Deserialize<Dictionary<string, string>>(mergeEl.GetRawText()) ?? new();
-            if (doc.RootElement.TryGetProperty("exclude_months", out var exclEl))
-                config.ExcludeMonths = JsonSerializer.Deserialize<List<string>>(exclEl.GetRawText()) ?? new();
-            if (doc.RootElement.TryGetProperty("author_min_count", out var amcEl))
-                config.AuthorMinCount = amcEl.GetInt32();
-            if (doc.RootElement.TryGetProperty("input_folder", out var inEl))
-                config.InputFolder = inEl.GetString() ?? "";
-            if (doc.RootElement.TryGetProperty("output_folder", out var outEl))
-                config.OutputFolder = outEl.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("exclude_months", out var excludeEl))
+                config.ExcludeMonths = JsonSerializer.Deserialize<List<string>>(excludeEl.GetRawText()) ?? new();
+            if (doc.RootElement.TryGetProperty("author_min_count", out var authorMinEl))
+                config.AuthorMinCount = authorMinEl.GetInt32();
+            if (doc.RootElement.TryGetProperty("input_folder", out var inputEl))
+                config.InputFolder = inputEl.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("output_folder", out var outputEl))
+                config.OutputFolder = outputEl.GetString() ?? "";
 
+            if (doc.RootElement.TryGetProperty("classification", out var cls))
+            {
+                var clsOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                config.Classification = JsonSerializer.Deserialize<ClassificationConfig>(cls.GetRawText(), clsOptions)
+                                        ?? new ClassificationConfig();
+            }
             return config;
         }
 
         static string GetOutputPath(Config config, string filename)
         {
-            string baseDir = string.IsNullOrEmpty(config.OutputFolder) ? "." : config.OutputFolder;
-            if (!Directory.Exists(baseDir)) Directory.CreateDirectory(baseDir);
-            return Path.Combine(baseDir, filename);
+            string dir = string.IsNullOrEmpty(config.OutputFolder) ? "." : config.OutputFolder;
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, filename);
         }
 
-        static string EscapeCsvField(string field)
+        static string EscapeCsvField(string s)
         {
-            if (string.IsNullOrEmpty(field)) return "";
-            if (field.Contains(',') || field.Contains('"') || field.Contains('\n'))
-                return $"\"{field.Replace("\"", "\"\"")}\"";
-            return field;
+            if (string.IsNullOrEmpty(s)) return "";
+            if (s.Contains(',') || s.Contains('"') || s.Contains('\n'))
+                return $"\"{s.Replace("\"", "\"\"")}\"";
+            return s;
+        }
+
+        // ==================== 模式 6：智能分类 ====================
+        static async Task RunClassification(Config config)
+        {
+            var clsConf = config.Classification;
+            if (clsConf.Categories == null || clsConf.Categories.Count == 0)
+            {
+                Console.WriteLine("错误：配置文件中未定义分类类别 (classification.categories)。");
+                return;
+            }
+
+            string mergedPath = GetOutputPath(config, "merged_history_with_tags.json");
+            if (!File.Exists(mergedPath))
+            {
+                Console.WriteLine($"文件不存在: {mergedPath}，请先运行模式 5 生成带标签的合并文件。");
+                return;
+            }
+
+            var items = LoadVideoItems(mergedPath);
+            if (items == null || items.Count == 0) { Console.WriteLine("合并文件无数据。"); return; }
+
+            // 只分类 archive 视频
+            var toClassify = items.Where(it => it.Business == "archive").ToList();
+            if (toClassify.Count == 0) { Console.WriteLine("没有 archive 视频。"); return; }
+
+            Console.WriteLine($"需分类视频：{toClassify.Count} 条，类别：{string.Join(", ", clsConf.Categories)}");
+            int batchSize = Math.Max(1, clsConf.BatchSize);
+            var batches = new List<List<VideoItem>>();
+            for (int i = 0; i < toClassify.Count; i += batchSize)
+                batches.Add(toClassify.GetRange(i, Math.Min(batchSize, toClassify.Count - i)));
+
+            // 分类结果字典：bvid -> category
+            var results = new Dictionary<string, string>();
+            int batchIdx = 0;
+            foreach (var batch in batches)
+            {
+                batchIdx++;
+                Console.Write($"\r处理批次 {batchIdx}/{batches.Count}...");
+                var batchResults = await ClassifyBatch(batch, clsConf);
+                if (batchResults != null)
+                {
+                    foreach (var kv in batchResults)
+                        results[kv.Key] = kv.Value;
+                }
+                else
+                {
+                    // 批次失败，标记为"分类失败"
+                    foreach (var item in batch)
+                        results[item.Bvid] = "分类失败";
+                }
+            }
+            Console.WriteLine($"\n分类完成，共 {results.Count} 条结果。");
+
+            // 输出 CSV
+            string csvPath = GetOutputPath(config, "classification.csv");
+            using var writer = new StreamWriter(csvPath, false, Encoding.UTF8);
+            writer.WriteLine("URL,Title,DefaultTag,DetailTags,Category");
+            foreach (var item in toClassify)
+            {
+                string url = $"https://www.bilibili.com/video/{item.Bvid}";
+                string title = EscapeCsvField(item.Title ?? "");
+                string defTag = EscapeCsvField(item.TagName ?? "");
+                string detailTags = item.DetailTags != null
+                    ? EscapeCsvField(string.Join(", ", item.DetailTags.Select(t => t.TagName)))
+                    : "";
+                string cat = results.TryGetValue(item.Bvid, out var c) ? c : "未知";
+                writer.WriteLine($"{url},{title},{defTag},{detailTags},{EscapeCsvField(cat)}");
+            }
+            Console.WriteLine($"分类结果已写入: {csvPath}");
+        }
+
+        static async Task<Dictionary<string, string>> ClassifyBatch(List<VideoItem> batch, ClassificationConfig clsConf)
+        {
+            // 构建类别列表，如果不存在“其他”则自动添加
+            var categories = new List<string>(clsConf.Categories);
+            if (!categories.Contains("其他")) categories.Add("其他");
+
+            // 构建紧凑提示词
+            var sb = new StringBuilder();
+            sb.Append($"分类到：{string.Join("/", categories)}。");
+            sb.Append("根据标题和标签选最合适的。不确定时用\"其他\"。");
+            sb.Append("只返回JSON：{\"results\":[{\"i\":序号,\"c\":类别}]}\n");
+            sb.Append("视频：\n");
+
+            for (int i = 0; i < batch.Count; i++)
+            {
+                var item = batch[i];
+                var tags = item.DetailTags?.Select(t => t.TagName).ToList() ?? new List<string>();
+                string tagsStr = string.Join(",", tags);
+                sb.Append($"{i + 1}.{item.Title}|{tagsStr}\n");
+            }
+
+            // 调用 API 的方法保持不变，只需稍后解析索引映射回 bvid
+            Dictionary<string, string> indexResult = null;
+            if (clsConf.Provider.ToLower() == "ollama")
+                indexResult = await ClassifyWithOllama(sb.ToString(), clsConf);
+            else if (clsConf.Provider.ToLower() == "deepseek")
+                indexResult = await ClassifyWithDeepSeek(sb.ToString(), clsConf);
+            else
+                return null;
+
+            // 将索引结果转换为 bvid -> category 的字典
+            var result = new Dictionary<string, string>();
+            if (indexResult != null)
+            {
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    string key = (i + 1).ToString();
+                    if (indexResult.TryGetValue(key, out var cat))
+                        result[batch[i].Bvid] = cat;
+                    else
+                        result[batch[i].Bvid] = "分类失败";
+                }
+            }
+            return result;
+        }
+
+        static async Task<Dictionary<string, string>> ClassifyWithOllama(string prompt, ClassificationConfig conf)
+        {
+            var requestBody = new
+            {
+                model = conf.OllamaModel,
+                messages = new[]
+                {
+            new
+            {
+                role = "user",
+                content = prompt
+            }
+        },
+                stream = false,
+                response_format = new { type = "json_object" }  // 强制模型返回 JSON
+            };
+
+            string jsonBody = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+            });
+            var httpContent = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+
+            try
+            {
+                var response = await httpClient.PostAsync($"{conf.OllamaUrl}/v1/chat/completions", httpContent);
+                response.EnsureSuccessStatusCode();
+                string responseJson = await response.Content.ReadAsStringAsync();
+
+                using var doc = JsonDocument.Parse(responseJson);
+                var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+                return ParseClassificationByIndex(content);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nOllama 调用失败: {ex.Message}");
+                return null;
+            }
+        }
+
+        static async Task<Dictionary<string, string>> ClassifyWithDeepSeek(string prompt, ClassificationConfig conf)
+        {
+            string apiKey = conf.DeepSeekApiKey;
+            if (string.IsNullOrEmpty(apiKey))
+                apiKey = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
+            if (string.IsNullOrEmpty(apiKey))
+            {
+                Console.WriteLine("\nDeepSeek API Key 未设置（配置或环境变量 DEEPSEEK_API_KEY）。");
+                return null;
+            }
+
+            var requestBody = new
+            {
+                model = conf.DeepSeekModel,
+                messages = new[] { new { role = "user", content = prompt } },
+                response_format = new { type = "json_object" }
+            };
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.deepseek.com/v1/chat/completions");
+            req.Headers.Add("Authorization", $"Bearer {apiKey}");
+            req.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
+
+            try
+            {
+                var resp = await httpClient.SendAsync(req);
+                resp.EnsureSuccessStatusCode();
+                var json = await resp.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+                var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+                return ParseClassificationByIndex(content);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nDeepSeek 调用失败: {ex.Message}");
+                return null;
+            }
+        }
+
+        static Dictionary<string, string> ParseClassificationByIndex(string responseContent)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(responseContent);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("results", out var arr) && arr.ValueKind == JsonValueKind.Array)
+                {
+                    var dict = new Dictionary<string, string>();
+                    foreach (var el in arr.EnumerateArray())
+                    {
+                        // 索引可能是数字或字符串
+                        string idx = el.GetProperty("i").ToString();
+                        string cat = el.GetProperty("c").GetString();
+                        dict[idx] = cat;
+                    }
+                    return dict;
+                }
+            }
+            catch { }
+            return null;
         }
     }
 }
