@@ -131,10 +131,13 @@
   "classification": {
     "provider": "deepseek",
     "ollama_url": "http://localhost:11434",
-    "ollama_model": "qwen2.5:1.5b",
-    "deepseek_api_key": "",
+    "ollama_model": "qwen2.5:3b",
+    "deepseek_api_key": "YOUR_API_KEY",
     "deepseek_model": "deepseek-v4-flash",
-    "categories": [ "科技", "生活", "游戏", "音乐", "动物", "搞笑", "影视", "知识", "其他" ],
-    "batch_size": 10
+    "temperature": 0,
+    "max_tokens": 2048,
+    "max_concurrency": 1,
+    "batch_size": 15,
+    "categories": [ "科技", "生活", "游戏", "音乐", "动物", "搞笑", "影视", "知识", "其他" ]
   }
 }
