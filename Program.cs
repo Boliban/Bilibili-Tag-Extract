@@ -717,11 +717,10 @@ namespace VideoTagProcessor
                 var cleanJson = ExtractJson(rawContent);
                 var result = ParseClassificationByIndex(cleanJson);
                 //输出调试
-                if (result == null)
-                {
-                    Console.WriteLine($"\n[解析失败] 提取的JSON有效，但缺少 results 数组或索引/分类字段");
-                    Console.WriteLine($"提取的JSON: {cleanJson?[..Math.Min(cleanJson.Length, 300)]}");
-                }
+                // ★ 输出原始响应到控制台（用于调试）
+                Console.WriteLine($"\n[Ollama 原始响应] {responseJson}");
+
+                Console.WriteLine(ParseClassificationByIndex(ExtractJson(rawContent))); 
 
                 // 解析 JSON 获取索引-类别映射
                 return ParseClassificationByIndex(cleanJson);
@@ -751,7 +750,8 @@ namespace VideoTagProcessor
                 messages = new[] { new { role = "user", content = prompt } },
                 temperature = conf.Temperature,
                 max_tokens = conf.MaxTokens,
-                response_format = new { type = "json_object" }
+                response_format = new { type = "json_object" },
+                thinking = new { type = "disabled" }
             };
 
             var jsonBody = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
