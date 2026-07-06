@@ -41,7 +41,7 @@ namespace VideoTagProcessor
 
     public class Config
     {
-        public Dictionary<string, string> MergeMapping { get; set; } = new();
+        public Dictionary<string, List<string>> MergeMapping { get; set; } = new();
         public List<string> ExcludeMonths { get; set; } = new();
         public int AuthorMinCount { get; set; } = 5;
         public string InputFolder { get; set; } = "";
@@ -335,30 +335,48 @@ namespace VideoTagProcessor
         // ==================== 统计 ====================
         static async Task RunStatistics(List<VideoItem> items, Config config, string overrideCsvPath = null)
         {
-            var withDate = items.Select(it =>
+            // 1. 构建反向映射：原始标签 → 目标标签
+            var reverseMap = new Dictionary<string, string>();
+            foreach (var kvp in config.MergeMapping)
             {
-                var dt = DateTimeOffset.FromUnixTimeSeconds(it.ViewAt).LocalDateTime;
-                return new { it.TagName, it.AuthorName, YearMonth = dt.ToString("yyyy-MM") };
+                string targetTag = kvp.Key;
+                foreach (var sourceTag in kvp.Value)
+                {
+                    if (!reverseMap.ContainsKey(sourceTag))
+                        reverseMap[sourceTag] = targetTag;
+                }
+            }
+
+            var itemsWithDate = items.Select(item =>
+            {
+                DateTime date = DateTimeOffset.FromUnixTimeSeconds(item.ViewAt).LocalDateTime;
+                return new { item.TagName, item.AuthorName, YearMonth = date.ToString("yyyy-MM") };
             }).Where(x => !config.ExcludeMonths.Contains(x.YearMonth)).ToList();
 
-            var unmapped = withDate.Select(x => x.TagName).Distinct()
-                .Where(t => !config.MergeMapping.ContainsKey(t)).ToList();
+            // 2. 检查未映射标签（原始标签不在反向映射中）
+            var unmapped = itemsWithDate.Select(x => x.TagName)
+                .Distinct()
+                .Where(t => !reverseMap.ContainsKey(t))
+                .ToList();
             if (unmapped.Count > 0)
             {
-                Console.WriteLine("未映射标签：");
-                unmapped.ForEach(t => Console.WriteLine($"  - {t}"));
+                Console.WriteLine("错误：以下标签未在 merge_mapping 中定义，请更新 config.json：");
+                foreach (var t in unmapped.OrderBy(t => t))
+                    Console.WriteLine($"  - {t}");
                 return;
             }
 
-            var mapped = withDate.Select(x => new
+            // 3. 应用映射
+            var mapped = itemsWithDate.Select(x => new
             {
                 x.YearMonth,
-                Tag = config.MergeMapping[x.TagName],
+                Tag = reverseMap[x.TagName],
                 Author = x.AuthorName
             }).ToList();
 
             var months = mapped.Select(x => x.YearMonth).Distinct().OrderBy(m => m).ToList();
 
+            // 标签矩阵
             var tagMat = mapped.GroupBy(x => new { x.Tag, x.YearMonth })
                 .GroupBy(g => g.Key.Tag)
                 .ToDictionary(g => g.Key, g => g.ToDictionary(x => x.Key.YearMonth, x => x.Count()));
@@ -367,9 +385,11 @@ namespace VideoTagProcessor
             string tagCsv = overrideCsvPath ?? GetOutputPath(config, "output.csv");
             WriteTagMatrixCsv(tagCsv, sortedTags, months, tagMat);
 
+            // 作者矩阵
             var authorMat = mapped.GroupBy(x => new { x.Author, x.YearMonth })
                 .GroupBy(g => g.Key.Author)
                 .ToDictionary(g => g.Key, g => g.ToDictionary(x => x.Key.YearMonth, x => x.Count()));
+
             var filteredAuthors = authorMat
                 .Where(kv => kv.Value.Values.Sum() >= config.AuthorMinCount)
                 .OrderByDescending(kv => kv.Value.Values.Sum())
@@ -528,7 +548,7 @@ namespace VideoTagProcessor
             return items;
         }
 
-        static List<VideoItem> LoadVideoItems(string path)
+        static List<VideoItem>? LoadVideoItems(string path)
         {
             if (!File.Exists(path)) return null;
             return JsonSerializer.Deserialize<List<VideoItem>>(File.ReadAllText(path),
@@ -549,7 +569,8 @@ namespace VideoTagProcessor
             using var doc = JsonDocument.Parse(json);
 
             if (doc.RootElement.TryGetProperty("merge_mapping", out var mergeEl))
-                config.MergeMapping = JsonSerializer.Deserialize<Dictionary<string, string>>(mergeEl.GetRawText()) ?? new();
+                config.MergeMapping = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(mergeEl.GetRawText())
+                                      ?? new Dictionary<string, List<string>>();
             if (doc.RootElement.TryGetProperty("exclude_months", out var excludeEl))
                 config.ExcludeMonths = JsonSerializer.Deserialize<List<string>>(excludeEl.GetRawText()) ?? new();
             if (doc.RootElement.TryGetProperty("author_min_count", out var authorMinEl))
