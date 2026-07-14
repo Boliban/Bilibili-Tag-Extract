@@ -35,6 +35,27 @@
     "batch_size": 10,
     "EnableWarmup": true,
     "WarmupWaitSeconds": 3,
-    "categories": [ "科技", "生活", "游戏", "音乐", "动物", "搞笑", "影视", "知识", "其他" ]
+    "categories": [ "科技", "生活", "游戏", "音乐", "动物", "搞笑", "影视", "知识", "其他" ],
+    "pre_classify_rules": {
+      "游戏": {
+        "keywords": [ "游戏", "单机", "FPS", "射击", "联机" ],
+        "fields": [ "tag_name", "detail_tags" ],
+        "require_all_fields": false
+      },
+      "科技": {
+        "keywords": [ "编程", "AI", "机器学习", "算法" ],
+        "fields": [ "title", "detail_tags" ],
+        "require_all_fields": false
+      },
+      "动物": {
+        "keywords": [ "狗", "汪星人" ],
+        "fields": [ "tag_name", "detail_tags" ],
+        "require_all_fields": false
+      },
+      "搞笑": {
+        "keywords": [ "搞笑" ],
+        "fields": [ "detail_tags" ],
+        "require_all_fields": false
+      }
+    }
   }
-}

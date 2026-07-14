@@ -70,21 +70,29 @@ namespace VideoTagProcessor
         [JsonPropertyName("batch_size")]
         public int BatchSize { get; set; } = 10;
 
-        // 新增控制参数
         [JsonPropertyName("temperature")]
-        public double Temperature { get; set; } = 0.1;          // 越低越确定，推荐 0~0.3
+        public double Temperature { get; set; } = 0.1;
 
         [JsonPropertyName("max_tokens")]
-        public int MaxTokens { get; set; } = 1024;              // 输出 token 上限
+        public int MaxTokens { get; set; } = 1024;
 
         [JsonPropertyName("max_concurrency")]
-        public int MaxConcurrency { get; set; } = 3;            // 并行批次数，根据 API 限制调整
-        // 是否启用预热（仅对 DeepSeek 有效，建议启用）
+        public int MaxConcurrency { get; set; } = 3;
+
         public bool EnableWarmup { get; set; } = true;
-        // 预热请求后等待缓存落盘的秒数（建议 2~5 秒）
         public int WarmupWaitSeconds { get; set; } = 3;
+
+        [JsonPropertyName("pre_classify_rules")]
+        public Dictionary<string, PreClassifyRule> PreClassifyRules { get; set; } = new();
     }
-        // 新增token显示
+
+    public class PreClassifyRule
+    {
+        public List<string> Keywords { get; set; } = new();
+        public List<string> Fields { get; set; } = new(); // 为空则默认全部
+        public bool RequireAllFields { get; set; } = false; // true 时所有字段都必须匹配
+    }
+
     public class UsageInfo
     {
         public int PromptTokens { get; set; }
@@ -114,7 +122,6 @@ namespace VideoTagProcessor
         public int Count { get; set; }
     }
 
-    // 辅助类
     public class ClassificationItem
     {
         [JsonPropertyName("i")] public int I { get; set; }
@@ -629,6 +636,20 @@ namespace VideoTagProcessor
 
             Console.WriteLine($"需分类视频：{toClassify.Count} 条，类别：{string.Join(", ", clsConf.Categories)}");
 
+            // ==================== 新增：预分类 ====================
+            var preResults = PreClassify(toClassify, clsConf);
+            int preCount = preResults.Count;
+            int totalCount = toClassify.Count;
+            double prePercent = totalCount > 0 ? (double)preCount / totalCount * 100 : 0;
+            Console.WriteLine($"预分类：{preCount}/{totalCount} ({prePercent:F2}%)");
+
+            var toClassifyRemaining = toClassify.Where(item => !preResults.ContainsKey(item.Bvid)).ToList();
+            Console.WriteLine($"剩余需AI分类：{toClassifyRemaining.Count} 条");
+
+            // 初始化 results 包含预分类结果
+            var results = new Dictionary<string, string>(preResults);
+            // ===================================================
+
             // ==================== 新增：预热 ====================
             if (clsConf.Provider?.ToLower() == "deepseek" && clsConf.EnableWarmup)
             {
@@ -636,7 +657,6 @@ namespace VideoTagProcessor
 
                 try
                 {
-                    // 构造一个虚拟视频，仅用于占位
                     var dummyItem = new VideoItem
                     {
                         Bvid = "warmup_dummy",
@@ -645,8 +665,6 @@ namespace VideoTagProcessor
                         DetailTags = new List<BiliTag> { new BiliTag { TagName = "dummy" } }
                     };
                     var dummyBatch = new List<VideoItem> { dummyItem };
-
-                    // 发送预热请求（不关心返回结果）
                     _ = await ClassifyBatch(dummyBatch, clsConf);
                 }
                 catch (Exception ex)
@@ -654,7 +672,6 @@ namespace VideoTagProcessor
                     Console.WriteLine($"预热请求失败（不影响后续分类）: {ex.Message}");
                 }
 
-                // 等待缓存落盘
                 await Task.Delay(clsConf.WarmupWaitSeconds * 1000);
                 Console.WriteLine("预热完成。");
             }
@@ -662,18 +679,16 @@ namespace VideoTagProcessor
 
             int batchSize = Math.Max(1, clsConf.BatchSize);
             var batches = new List<List<VideoItem>>();
-            for (int i = 0; i < toClassify.Count; i += batchSize)
-                batches.Add(toClassify.GetRange(i, Math.Min(batchSize, toClassify.Count - i)));
+            for (int i = 0; i < toClassifyRemaining.Count; i += batchSize)
+                batches.Add(toClassifyRemaining.GetRange(i, Math.Min(batchSize, toClassifyRemaining.Count - i)));
 
-            // 分类结果字典：bvid -> category
-            var results = new Dictionary<string, string>();
+            // 分类结果字典：bvid -> category（已包含预分类）
             int batchIdx = 0;
             var semaphore = new SemaphoreSlim(clsConf.MaxConcurrency);
             var stopwatchTotal = Stopwatch.StartNew();
 
             var batchTimes = new ConcurrentBag<double>();
 
-            // 使用带索引的 Select，以便知道每个批次的原始位置
             var tasks = batches.Select(async (batch, index) =>
             {
                 await semaphore.WaitAsync();
@@ -689,7 +704,7 @@ namespace VideoTagProcessor
                     if (index != batches.Count - 1)
                         batchTimes.Add(sw.Elapsed.TotalSeconds);
 
-                    return response; // 返回 ClassificationResponse
+                    return response;
                 }
                 finally
                 {
@@ -700,7 +715,6 @@ namespace VideoTagProcessor
             var batchResults = await Task.WhenAll(tasks);
             stopwatchTotal.Stop();
 
-            // 计算去除最后一个批次后的平均耗时
             if (batchTimes.Any())
             {
                 var avgTime = batchTimes.Average();
@@ -728,7 +742,7 @@ namespace VideoTagProcessor
                 }
             }
 
-            // 补全未分类的视频（即那些未出现在 results 中的 bvid）
+            // 补全未分类的视频（包括AI分类失败的和预分类未覆盖的）
             foreach (var item in toClassify)
             {
                 if (!results.ContainsKey(item.Bvid))
@@ -775,10 +789,10 @@ namespace VideoTagProcessor
             }
             Console.WriteLine("=====================================\n");
 
-            // 输出 CSV
+            // 输出 CSV（新增 PreClassified 列）
             string csvPath = GetOutputPath(config, "classification.csv");
             using var writer = new StreamWriter(csvPath, false, Encoding.UTF8);
-            writer.WriteLine("URL,Title,DefaultTag,DetailTags,Category");
+            writer.WriteLine("URL,Title,DefaultTag,DetailTags,Category,PreClassified");
             foreach (var item in toClassify)
             {
                 string url = $"https://www.bilibili.com/video/{item.Bvid}";
@@ -788,18 +802,17 @@ namespace VideoTagProcessor
                     ? EscapeCsvField(string.Join(", ", item.DetailTags.Select(t => t.TagName)))
                     : "";
                 string cat = results.TryGetValue(item.Bvid, out var c) ? c : "未知";
-                writer.WriteLine($"{url},{title},{defTag},{detailTags},{EscapeCsvField(cat)}");
+                bool preClassified = preResults.ContainsKey(item.Bvid);
+                writer.WriteLine($"{url},{title},{defTag},{detailTags},{EscapeCsvField(cat)},{preClassified}");
             }
             Console.WriteLine($"分类结果已写入: {csvPath}");
         }
 
         static async Task<ClassificationResponse> ClassifyBatch(List<VideoItem> batch, ClassificationConfig conf)
         {
-            // 构建类别列表（若没有“其他”则自动添加）
             var categories = new List<string>(conf.Categories);
             if (!categories.Contains("其他")) categories.Add("其他");
 
-            // 强化提示词
             var prompt = new StringBuilder();
             var categoriesStr = string.Join("、", categories);
             prompt.AppendLine("你是一个专业的视频内容分类专家，擅长根据标签和元数据将视频精准归类。");
@@ -816,7 +829,6 @@ namespace VideoTagProcessor
                 prompt.AppendLine($"{i + 1}. 大标签：{item.TagName} | 标签：{string.Join("，", tags)}");
             }
 
-            // 根据 provider 调用 API
             ClassificationResponse response;
             if (conf.Provider.ToLower() == "ollama")
                 response = await ClassifyWithOllama(prompt.ToString(), conf);
@@ -825,18 +837,15 @@ namespace VideoTagProcessor
             else
                 return null;
 
-            // ★ 关键修改：即使结果解析失败，也保留原始 usage 信息
             if (response == null || response.Results == null)
             {
                 var fallback = new Dictionary<string, string>();
                 foreach (var item in batch)
                     fallback[item.Bvid] = "分类失败";
-                // 保留原始 usage（若 response 非 null）
                 var usage = response?.Usage ?? new UsageInfo();
                 return new ClassificationResponse { Results = fallback, Usage = usage };
             }
 
-            // 将索引结果映射到 bvid
             var result = new Dictionary<string, string>();
             for (int i = 0; i < batch.Count; i++)
             {
@@ -846,14 +855,11 @@ namespace VideoTagProcessor
             return new ClassificationResponse { Results = result, Usage = response.Usage };
         }
 
-
         static async Task<ClassificationResponse> ClassifyWithOllama(string prompt, ClassificationConfig conf)
         {
-            // 构建有效类别列表（包含“其他”）
             var validCategories = new List<string>(conf.Categories);
             if (!validCategories.Contains("其他")) validCategories.Add("其他");
 
-            // 定义 JSON Schema，锁定输出字段和枚举值
             var jsonSchema = new
             {
                 type = "json_schema",
@@ -912,13 +918,11 @@ namespace VideoTagProcessor
                 using var doc = JsonDocument.Parse(responseJson);
                 var rawContent = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
 
-                // 调试输出
                 Console.WriteLine($"\n[Ollama 原始响应] {responseJson}");
 
                 var cleanJson = ExtractJson(rawContent);
                 var indexResult = ParseClassificationByIndex(cleanJson);
 
-                // 提取 usage（Ollama 兼容 OpenAI 格式）
                 var usage = new UsageInfo();
                 if (doc.RootElement.TryGetProperty("usage", out var usageElem))
                 {
@@ -977,7 +981,6 @@ namespace VideoTagProcessor
                 var rawContent = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
                 var indexResult = ParseClassificationByIndex(ExtractJson(rawContent));
 
-                // 提取 usage（包含缓存信息）
                 var usage = new UsageInfo();
                 if (doc.RootElement.TryGetProperty("usage", out var usageElem))
                 {
@@ -1000,18 +1003,14 @@ namespace VideoTagProcessor
         {
             if (string.IsNullOrWhiteSpace(raw)) return raw;
 
-            // 移除思考链标签（如 <think>）
             var cleaned = Regex.Replace(raw, @"<[^>]*>", "").Trim();
 
-            // 提取 Markdown 代码块内的 JSON
             var mdMatch = Regex.Match(cleaned, @"```(?:json)?\s*([\s\S]*?)\s*```", RegexOptions.IgnoreCase);
             if (mdMatch.Success) cleaned = mdMatch.Groups[1].Value.Trim();
 
-            // 找到第一个 '{' 的位置
             int start = cleaned.IndexOf('{');
             if (start == -1) return cleaned;
 
-            // 从起始大括号开始，手动配对大括号
             int braceCount = 0;
             bool inString = false, escaped = false;
             for (int i = start; i < cleaned.Length; i++)
@@ -1032,11 +1031,8 @@ namespace VideoTagProcessor
                         braceCount--;
                         if (braceCount == 0)
                         {
-                            // 截取到配对的右大括号，并去除尾部多余字符
                             var jsonCandidate = cleaned.Substring(start, i - start + 1);
-                            // 再次确保尾部没有非 JSON 字符（如反引号、逗号、空格）
                             jsonCandidate = jsonCandidate.TrimEnd(',', ' ', '\t', '\n', '\r', '`');
-                            // 如果最后一个字符不是 '}'，重新寻找真正的结尾
                             if (!jsonCandidate.EndsWith("}"))
                             {
                                 int lastBrace = jsonCandidate.LastIndexOf('}');
@@ -1047,11 +1043,9 @@ namespace VideoTagProcessor
                     }
                 }
             }
-            // 无完整配对，返回从第一个 '{' 开始的剩余部分
             return cleaned.Substring(start).TrimEnd(',', ' ', '\t', '\n', '\r', '`');
         }
 
-        // 解析方法
         static Dictionary<string, string> ParseClassificationByIndex(string jsonContent)
         {
             if (string.IsNullOrWhiteSpace(jsonContent)) return null;
@@ -1061,14 +1055,12 @@ namespace VideoTagProcessor
                 using var doc = JsonDocument.Parse(jsonContent);
                 var root = doc.RootElement;
 
-                // 尝试获取 results 数组
                 if (!root.TryGetProperty("results", out var resultsArray) || resultsArray.ValueKind != JsonValueKind.Array)
                     return null;
 
                 var dict = new Dictionary<string, string>();
                 foreach (var item in resultsArray.EnumerateArray())
                 {
-                    // 尝试获取 i（可以是数字或字符串）
                     if (!item.TryGetProperty("i", out var iElem)) continue;
                     string idx;
                     if (iElem.ValueKind == JsonValueKind.Number)
@@ -1078,7 +1070,6 @@ namespace VideoTagProcessor
                     else
                         continue;
 
-                    // 尝试获取 c（类别）
                     if (!item.TryGetProperty("c", out var cElem) || cElem.ValueKind != JsonValueKind.String)
                         continue;
                     string cat = cElem.GetString();
@@ -1090,16 +1081,13 @@ namespace VideoTagProcessor
             }
             catch (JsonException)
             {
-                // 如果 JSON 解析失败，回退到正则（作为后备）
                 return ParseClassificationByIndexFallback(jsonContent);
             }
         }
 
-        // 后备方案：正则匹配（保留原有逻辑，以防 JSON 解析失败）
         static Dictionary<string, string> ParseClassificationByIndexFallback(string jsonContent)
         {
             var dict = new Dictionary<string, string>();
-            // 更宽松的正则：支持 "i":数字 或 "i":"数字"，且顺序不限
             var matches = Regex.Matches(jsonContent,
                 @"""i""\s*:\s*(?:(\d+)|""(\d+)"")\s*,\s*""c""\s*:\s*""([^""]*)""");
             foreach (Match m in matches)
@@ -1110,6 +1098,95 @@ namespace VideoTagProcessor
                     dict[idx] = cat;
             }
             return dict.Count > 0 ? dict : null;
+        }
+
+        // ==================== 新增：预分类方法 ====================
+        static Dictionary<string, string> PreClassify(List<VideoItem> items, ClassificationConfig conf)
+        {
+            var result = new Dictionary<string, string>();
+            var rules = conf.PreClassifyRules;
+            if (rules == null || rules.Count == 0)
+                return result;
+
+            // 用于统计每个规则命中数
+            var ruleHitCount = new Dictionary<string, int>();
+            foreach (var rule in rules)
+                ruleHitCount[rule.Key] = 0;
+
+            int unmatchedCount = 0;
+            const int maxUnmatchedDisplay = 5; // 只显示前5个未匹配的视频详情
+
+            foreach (var item in items)
+            {
+                bool matched = false;
+                foreach (var rule in rules)
+                {
+                    string category = rule.Key;
+                    var ruleObj = rule.Value;
+                    var fields = ruleObj.Fields;
+                    if (fields == null || fields.Count == 0)
+                        fields = new List<string> { "title", "tag_name", "detail_tags" };
+
+                    bool requireAll = ruleObj.RequireAllFields;
+
+                    var fieldMatches = new Dictionary<string, bool>();
+                    foreach (var field in fields)
+                    {
+                        string text = "";
+                        if (field == "title") text = item.Title ?? "";
+                        else if (field == "tag_name") text = item.TagName ?? "";
+                        else if (field == "detail_tags")
+                        {
+                            if (item.DetailTags != null)
+                                text = string.Join(" ", item.DetailTags.Select(t => t.TagName));
+                        }
+                        bool fieldHit = false;
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            fieldHit = ruleObj.Keywords.Any(k => text.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0);
+                        }
+                        fieldMatches[field] = fieldHit;
+                    }
+
+                    if (requireAll)
+                    {
+                        matched = fields.All(f => fieldMatches.TryGetValue(f, out bool hit) && hit);
+                    }
+                    else
+                    {
+                        matched = fields.Any(f => fieldMatches.TryGetValue(f, out bool hit) && hit);
+                    }
+
+                    if (matched)
+                    {
+                        result[item.Bvid] = category;
+                        ruleHitCount[category] = ruleHitCount[category] + 1;
+                        break;
+                    }
+                }
+
+                if (!matched)
+                {
+                    unmatchedCount++;
+                    if (unmatchedCount <= maxUnmatchedDisplay)
+                    {
+                        Console.WriteLine($"未匹配视频: Bvid={item.Bvid}, Title={item.Title}, TagName={item.TagName}, DetailTags={(item.DetailTags != null ? string.Join(",", item.DetailTags.Select(t => t.TagName)) : "null")}");
+                    }
+                }
+            }
+
+            // 输出每个规则的命中数
+            Console.WriteLine("预分类规则命中统计：");
+            foreach (var kv in ruleHitCount)
+            {
+                Console.WriteLine($"  {kv.Key}: {kv.Value} 个视频");
+            }
+            if (unmatchedCount > maxUnmatchedDisplay)
+            {
+                Console.WriteLine($"... 还有 {unmatchedCount - maxUnmatchedDisplay} 个未匹配视频（未显示详情）");
+            }
+
+            return result;
         }
     }
 }
