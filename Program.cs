@@ -57,7 +57,7 @@ namespace VideoTagProcessor
         public string OllamaUrl { get; set; } = "http://localhost:11434";
 
         [JsonPropertyName("ollama_model")]
-        public string OllamaModel { get; set; } = "qwen2.5:3b";   // 推荐模型
+        public string OllamaModel { get; set; } = "qwen2.5:3b";
 
         [JsonPropertyName("deepseek_api_key")]
         public string DeepSeekApiKey { get; set; } = "";
@@ -82,6 +82,9 @@ namespace VideoTagProcessor
         public bool EnableWarmup { get; set; } = true;
         public int WarmupWaitSeconds { get; set; } = 3;
 
+        // 预分类开关
+        public bool EnablePreClassify { get; set; } = true;
+
         [JsonPropertyName("pre_classify_rules")]
         public Dictionary<string, PreClassifyRule> PreClassifyRules { get; set; } = new();
     }
@@ -90,7 +93,7 @@ namespace VideoTagProcessor
     {
         public List<string> Keywords { get; set; } = new();
         public List<string> Fields { get; set; } = new(); // 为空则默认全部
-        public bool RequireAllFields { get; set; } = false; // true 时所有字段都必须匹配
+        public bool RequireAllFields { get; set; } = false;
     }
 
     public class UsageInfo
@@ -636,25 +639,33 @@ namespace VideoTagProcessor
 
             Console.WriteLine($"需分类视频：{toClassify.Count} 条，类别：{string.Join(", ", clsConf.Categories)}");
 
-            // ==================== 新增：预分类 ====================
-            var preResults = PreClassify(toClassify, clsConf);
-            int preCount = preResults.Count;
-            int totalCount = toClassify.Count;
-            double prePercent = totalCount > 0 ? (double)preCount / totalCount * 100 : 0;
-            Console.WriteLine($"预分类：{preCount}/{totalCount} ({prePercent:F2}%)");
+            // ==================== 预分类（带冲突检测） ====================
+            var preResults = new Dictionary<string, string>();
+            int preHits = 0, preConflicts = 0, preUnmatched = 0;
 
+            if (clsConf.EnablePreClassify)
+            {
+                (preResults, preConflicts, preUnmatched) = PreClassify(toClassify, clsConf);
+                preHits = preResults.Count;
+                Console.WriteLine($"预分类命中：{preHits} 条，冲突（多规则）：{preConflicts} 条，未命中：{preUnmatched} 条");
+            }
+            else
+            {
+                Console.WriteLine("预分类已禁用，全部视频将交由 AI 分类。");
+                preResults = new Dictionary<string, string>();
+            }
+
+            // 剩余需AI分类的视频：未预分类的（即未命中且未冲突的）
             var toClassifyRemaining = toClassify.Where(item => !preResults.ContainsKey(item.Bvid)).ToList();
             Console.WriteLine($"剩余需AI分类：{toClassifyRemaining.Count} 条");
+            // ===========================================================
 
-            // 初始化 results 包含预分类结果
             var results = new Dictionary<string, string>(preResults);
-            // ===================================================
 
-            // ==================== 新增：预热 ====================
+            // 预热（保持不变）
             if (clsConf.Provider?.ToLower() == "deepseek" && clsConf.EnableWarmup)
             {
                 Console.WriteLine($"执行预热请求（等待 {clsConf.WarmupWaitSeconds} 秒让缓存落盘）...");
-
                 try
                 {
                     var dummyItem = new VideoItem
@@ -671,22 +682,310 @@ namespace VideoTagProcessor
                 {
                     Console.WriteLine($"预热请求失败（不影响后续分类）: {ex.Message}");
                 }
-
                 await Task.Delay(clsConf.WarmupWaitSeconds * 1000);
                 Console.WriteLine("预热完成。");
             }
-            // ===================================================
+
+            static async Task<ClassificationResponse> ClassifyBatch(List<VideoItem> batch, ClassificationConfig conf)
+            {
+                var categories = new List<string>(conf.Categories);
+                if (!categories.Contains("其他")) categories.Add("其他");
+
+                var prompt = new StringBuilder();
+                var categoriesStr = string.Join("、", categories);
+                prompt.AppendLine("你是一个专业的视频内容分类专家，擅长根据标签和元数据将视频精准归类。");
+                prompt.AppendLine($"!!!严格按标签将每个视频归入以下类别之一：{categoriesStr}。");
+                prompt.AppendLine("优先按较小范围标签分类，忽略标签中的广告。");
+                prompt.AppendLine("如果某个视频同时符合多个类别，请选择最具体的一个,不要过度依赖大标签，应综合判断。");
+                prompt.AppendLine("仅返回纯JSON对象：{\"results\":[{\"i\":序号,\"c\":\"类别\"}]}");
+                prompt.AppendLine("不要包含任何额外文字或思考过程。确保输出完整。");
+
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    var item = batch[i];
+                    var tags = item.DetailTags?.Select(t => t.TagName).ToList() ?? new List<string>();
+                    prompt.AppendLine($"{i + 1}. 大标签：{item.TagName} | 标签：{string.Join("，", tags)}");
+                }
+
+                ClassificationResponse response;
+                if (conf.Provider.ToLower() == "ollama")
+                    response = await ClassifyWithOllama(prompt.ToString(), conf);
+                else if (conf.Provider.ToLower() == "deepseek")
+                    response = await ClassifyWithDeepSeek(prompt.ToString(), conf);
+                else
+                    return null;
+
+                if (response == null || response.Results == null)
+                {
+                    var fallback = new Dictionary<string, string>();
+                    foreach (var item in batch)
+                        fallback[item.Bvid] = "分类失败";
+                    var usage = response?.Usage ?? new UsageInfo();
+                    return new ClassificationResponse { Results = fallback, Usage = usage };
+                }
+
+                var result = new Dictionary<string, string>();
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    string key = (i + 1).ToString();
+                    result[batch[i].Bvid] = response.Results.TryGetValue(key, out var cat) ? cat : "未知";
+                }
+                return new ClassificationResponse { Results = result, Usage = response.Usage };
+            }
+
+            static async Task<ClassificationResponse> ClassifyWithOllama(string prompt, ClassificationConfig conf)
+            {
+                var validCategories = new List<string>(conf.Categories);
+                if (!validCategories.Contains("其他")) validCategories.Add("其他");
+
+                var jsonSchema = new
+                {
+                    type = "json_schema",
+                    json_schema = new
+                    {
+                        name = "classification",
+                        strict = true,
+                        schema = new
+                        {
+                            type = "object",
+                            properties = new
+                            {
+                                results = new
+                                {
+                                    type = "array",
+                                    items = new
+                                    {
+                                        type = "object",
+                                        properties = new
+                                        {
+                                            i = new { type = "integer" },
+                                            c = new { type = "string", @enum = validCategories.ToArray() }
+                                        },
+                                        required = new[] { "i", "c" },
+                                        additionalProperties = false
+                                    }
+                                }
+                            },
+                            required = new[] { "results" },
+                            additionalProperties = false
+                        }
+                    }
+                };
+
+                var requestBody = new
+                {
+                    model = conf.OllamaModel,
+                    messages = new[] { new { role = "user", content = prompt } },
+                    stream = false,
+                    temperature = conf.Temperature,
+                    max_tokens = conf.MaxTokens,
+                    response_format = jsonSchema
+                };
+
+                var jsonBody = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+                });
+                var httpContent = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+
+                try
+                {
+                    var resp = await httpClient.PostAsync($"{conf.OllamaUrl}/v1/chat/completions", httpContent);
+                    resp.EnsureSuccessStatusCode();
+                    var responseJson = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(responseJson);
+                    var rawContent = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+
+                    Console.WriteLine($"\n[Ollama 原始响应] {responseJson}");
+
+                    var cleanJson = ExtractJson(rawContent);
+                    var indexResult = ParseClassificationByIndex(cleanJson);
+
+                    var usage = new UsageInfo();
+                    if (doc.RootElement.TryGetProperty("usage", out var usageElem))
+                    {
+                        if (usageElem.TryGetProperty("prompt_tokens", out var pt)) usage.PromptTokens = pt.GetInt32();
+                        if (usageElem.TryGetProperty("completion_tokens", out var ct)) usage.CompletionTokens = ct.GetInt32();
+                        if (usageElem.TryGetProperty("total_tokens", out var tt)) usage.TotalTokens = tt.GetInt32();
+                    }
+                    return new ClassificationResponse { Results = indexResult, Usage = usage };
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"\nOllama 调用失败: {ex.Message}");
+                    return null;
+                }
+            }
+
+            static async Task<ClassificationResponse> ClassifyWithDeepSeek(string prompt, ClassificationConfig conf)
+            {
+                string apiKey = conf.DeepSeekApiKey;
+                if (string.IsNullOrEmpty(apiKey))
+                    apiKey = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
+                if (string.IsNullOrEmpty(apiKey))
+                {
+                    Console.WriteLine("DeepSeek API Key 未设置");
+                    return null;
+                }
+
+                var requestBody = new
+                {
+                    model = conf.DeepSeekModel,
+                    messages = new[] { new { role = "user", content = prompt } },
+                    temperature = conf.Temperature,
+                    max_tokens = conf.MaxTokens,
+                    response_format = new { type = "json_object" },
+                    thinking = new { type = "disabled" }
+                };
+
+                var jsonBody = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+                });
+
+                using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.deepseek.com/v1/chat/completions");
+                req.Headers.Add("Authorization", $"Bearer {apiKey}");
+                req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+
+                try
+                {
+                    var resp = await httpClient.SendAsync(req);
+                    resp.EnsureSuccessStatusCode();
+                    var responseJson = await resp.Content.ReadAsStringAsync();
+
+                    Console.WriteLine($"\n[DeepSeek 原始响应] {responseJson}");
+
+                    using var doc = JsonDocument.Parse(responseJson);
+                    var rawContent = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+                    var indexResult = ParseClassificationByIndex(ExtractJson(rawContent));
+
+                    var usage = new UsageInfo();
+                    if (doc.RootElement.TryGetProperty("usage", out var usageElem))
+                    {
+                        if (usageElem.TryGetProperty("prompt_tokens", out var pt)) usage.PromptTokens = pt.GetInt32();
+                        if (usageElem.TryGetProperty("completion_tokens", out var ct)) usage.CompletionTokens = ct.GetInt32();
+                        if (usageElem.TryGetProperty("total_tokens", out var tt)) usage.TotalTokens = tt.GetInt32();
+                        if (usageElem.TryGetProperty("prompt_cache_hit_tokens", out var hit)) usage.PromptCacheHitTokens = hit.GetInt32();
+                        if (usageElem.TryGetProperty("prompt_cache_miss_tokens", out var miss)) usage.PromptCacheMissTokens = miss.GetInt32();
+                    }
+                    return new ClassificationResponse { Results = indexResult, Usage = usage };
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"DeepSeek 错误: {ex.Message}");
+                    return null;
+                }
+            }
+
+            static string ExtractJson(string raw)
+            {
+                if (string.IsNullOrWhiteSpace(raw)) return raw;
+
+                var cleaned = Regex.Replace(raw, @"<[^>]*>", "").Trim();
+
+                var mdMatch = Regex.Match(cleaned, @"```(?:json)?\s*([\s\S]*?)\s*```", RegexOptions.IgnoreCase);
+                if (mdMatch.Success) cleaned = mdMatch.Groups[1].Value.Trim();
+
+                int start = cleaned.IndexOf('{');
+                if (start == -1) return cleaned;
+
+                int braceCount = 0;
+                bool inString = false, escaped = false;
+                for (int i = start; i < cleaned.Length; i++)
+                {
+                    char c = cleaned[i];
+                    if (inString)
+                    {
+                        if (escaped) { escaped = false; continue; }
+                        if (c == '\\') { escaped = true; continue; }
+                        if (c == '"') inString = false;
+                    }
+                    else
+                    {
+                        if (c == '"') inString = true;
+                        else if (c == '{') braceCount++;
+                        else if (c == '}')
+                        {
+                            braceCount--;
+                            if (braceCount == 0)
+                            {
+                                var jsonCandidate = cleaned.Substring(start, i - start + 1);
+                                jsonCandidate = jsonCandidate.TrimEnd(',', ' ', '\t', '\n', '\r', '`');
+                                if (!jsonCandidate.EndsWith("}"))
+                                {
+                                    int lastBrace = jsonCandidate.LastIndexOf('}');
+                                    if (lastBrace >= 0) jsonCandidate = jsonCandidate.Substring(0, lastBrace + 1);
+                                }
+                                return jsonCandidate;
+                            }
+                        }
+                    }
+                }
+                return cleaned.Substring(start).TrimEnd(',', ' ', '\t', '\n', '\r', '`');
+            }
+
+            static Dictionary<string, string> ParseClassificationByIndex(string jsonContent)
+            {
+                if (string.IsNullOrWhiteSpace(jsonContent)) return null;
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(jsonContent);
+                    var root = doc.RootElement;
+
+                    if (!root.TryGetProperty("results", out var resultsArray) || resultsArray.ValueKind != JsonValueKind.Array)
+                        return null;
+
+                    var dict = new Dictionary<string, string>();
+                    foreach (var item in resultsArray.EnumerateArray())
+                    {
+                        if (!item.TryGetProperty("i", out var iElem)) continue;
+                        string idx;
+                        if (iElem.ValueKind == JsonValueKind.Number)
+                            idx = iElem.GetInt32().ToString();
+                        else if (iElem.ValueKind == JsonValueKind.String)
+                            idx = iElem.GetString();
+                        else
+                            continue;
+
+                        if (!item.TryGetProperty("c", out var cElem) || cElem.ValueKind != JsonValueKind.String)
+                            continue;
+                        string cat = cElem.GetString();
+
+                        if (!string.IsNullOrEmpty(idx) && !string.IsNullOrEmpty(cat))
+                            dict[idx] = cat;
+                    }
+                    return dict.Count > 0 ? dict : null;
+                }
+                catch (JsonException)
+                {
+                    return ParseClassificationByIndexFallback(jsonContent);
+                }
+            }
+
+            static Dictionary<string, string> ParseClassificationByIndexFallback(string jsonContent)
+            {
+                var dict = new Dictionary<string, string>();
+                var matches = Regex.Matches(jsonContent,
+                    @"""i""\s*:\s*(?:(\d+)|""(\d+)"")\s*,\s*""c""\s*:\s*""([^""]*)""");
+                foreach (Match m in matches)
+                {
+                    string idx = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+                    string cat = m.Groups[3].Value;
+                    if (!string.IsNullOrEmpty(idx))
+                        dict[idx] = cat;
+                }
+                return dict.Count > 0 ? dict : null;
+            }
 
             int batchSize = Math.Max(1, clsConf.BatchSize);
             var batches = new List<List<VideoItem>>();
             for (int i = 0; i < toClassifyRemaining.Count; i += batchSize)
                 batches.Add(toClassifyRemaining.GetRange(i, Math.Min(batchSize, toClassifyRemaining.Count - i)));
 
-            // 分类结果字典：bvid -> category（已包含预分类）
             int batchIdx = 0;
             var semaphore = new SemaphoreSlim(clsConf.MaxConcurrency);
             var stopwatchTotal = Stopwatch.StartNew();
-
             var batchTimes = new ConcurrentBag<double>();
 
             var tasks = batches.Select(async (batch, index) =>
@@ -697,13 +996,10 @@ namespace VideoTagProcessor
                 {
                     var response = await ClassifyBatch(batch, clsConf);
                     sw.Stop();
-
                     int currentBatch = Interlocked.Increment(ref batchIdx);
                     Console.WriteLine($"批次 {currentBatch}/{batches.Count} 完成，耗时 {sw.Elapsed.TotalSeconds:F2}s");
-
                     if (index != batches.Count - 1)
                         batchTimes.Add(sw.Elapsed.TotalSeconds);
-
                     return response;
                 }
                 finally
@@ -727,7 +1023,7 @@ namespace VideoTagProcessor
 
             Console.WriteLine($"\n分类全部完成！总耗时 ({stopwatchTotal.Elapsed.TotalSeconds:F2} 秒)");
 
-            // -------- 合并结果 & 统计用量 ----------
+            // 合并 AI 结果
             var validResponses = new List<ClassificationResponse>();
             foreach (var response in batchResults)
             {
@@ -742,7 +1038,7 @@ namespace VideoTagProcessor
                 }
             }
 
-            // 补全未分类的视频（包括AI分类失败的和预分类未覆盖的）
+            // 补全未分类（包括 AI 失败）
             foreach (var item in toClassify)
             {
                 if (!results.ContainsKey(item.Bvid))
@@ -751,11 +1047,10 @@ namespace VideoTagProcessor
 
             Console.WriteLine($"\n分类完成，共 {results.Count} 条结果。");
 
-            // -------- Token 统计汇总 ----------
+            // Token 统计（保持不变）
             int totalPromptTokens = 0, totalCompletionTokens = 0, totalTokens = 0;
             int totalCacheHit = 0, totalCacheMiss = 0;
             bool hasCacheData = false;
-
             foreach (var resp in validResponses)
             {
                 var u = resp.Usage;
@@ -789,7 +1084,7 @@ namespace VideoTagProcessor
             }
             Console.WriteLine("=====================================\n");
 
-            // 输出 CSV（新增 PreClassified 列）
+            // 输出 CSV（含 PreClassified 列）
             string csvPath = GetOutputPath(config, "classification.csv");
             using var writer = new StreamWriter(csvPath, false, Encoding.UTF8);
             writer.WriteLine("URL,Title,DefaultTag,DetailTags,Category,PreClassified");
@@ -808,317 +1103,26 @@ namespace VideoTagProcessor
             Console.WriteLine($"分类结果已写入: {csvPath}");
         }
 
-        static async Task<ClassificationResponse> ClassifyBatch(List<VideoItem> batch, ClassificationConfig conf)
-        {
-            var categories = new List<string>(conf.Categories);
-            if (!categories.Contains("其他")) categories.Add("其他");
-
-            var prompt = new StringBuilder();
-            var categoriesStr = string.Join("、", categories);
-            prompt.AppendLine("你是一个专业的视频内容分类专家，擅长根据标签和元数据将视频精准归类。");
-            prompt.AppendLine($"!!!严格按标签将每个视频归入以下类别之一：{categoriesStr}。");
-            prompt.AppendLine("优先按较小范围标签分类，忽略标签中的广告。");
-            prompt.AppendLine("如果某个视频同时符合多个类别，请选择最具体的一个,不要过度依赖大标签，应综合判断。");
-            prompt.AppendLine("仅返回纯JSON对象：{\"results\":[{\"i\":序号,\"c\":\"类别\"}]}");
-            prompt.AppendLine("不要包含任何额外文字或思考过程。确保输出完整。");
-
-            for (int i = 0; i < batch.Count; i++)
-            {
-                var item = batch[i];
-                var tags = item.DetailTags?.Select(t => t.TagName).ToList() ?? new List<string>();
-                prompt.AppendLine($"{i + 1}. 大标签：{item.TagName} | 标签：{string.Join("，", tags)}");
-            }
-
-            ClassificationResponse response;
-            if (conf.Provider.ToLower() == "ollama")
-                response = await ClassifyWithOllama(prompt.ToString(), conf);
-            else if (conf.Provider.ToLower() == "deepseek")
-                response = await ClassifyWithDeepSeek(prompt.ToString(), conf);
-            else
-                return null;
-
-            if (response == null || response.Results == null)
-            {
-                var fallback = new Dictionary<string, string>();
-                foreach (var item in batch)
-                    fallback[item.Bvid] = "分类失败";
-                var usage = response?.Usage ?? new UsageInfo();
-                return new ClassificationResponse { Results = fallback, Usage = usage };
-            }
-
-            var result = new Dictionary<string, string>();
-            for (int i = 0; i < batch.Count; i++)
-            {
-                string key = (i + 1).ToString();
-                result[batch[i].Bvid] = response.Results.TryGetValue(key, out var cat) ? cat : "未知";
-            }
-            return new ClassificationResponse { Results = result, Usage = response.Usage };
-        }
-
-        static async Task<ClassificationResponse> ClassifyWithOllama(string prompt, ClassificationConfig conf)
-        {
-            var validCategories = new List<string>(conf.Categories);
-            if (!validCategories.Contains("其他")) validCategories.Add("其他");
-
-            var jsonSchema = new
-            {
-                type = "json_schema",
-                json_schema = new
-                {
-                    name = "classification",
-                    strict = true,
-                    schema = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            results = new
-                            {
-                                type = "array",
-                                items = new
-                                {
-                                    type = "object",
-                                    properties = new
-                                    {
-                                        i = new { type = "integer" },
-                                        c = new { type = "string", @enum = validCategories.ToArray() }
-                                    },
-                                    required = new[] { "i", "c" },
-                                    additionalProperties = false
-                                }
-                            }
-                        },
-                        required = new[] { "results" },
-                        additionalProperties = false
-                    }
-                }
-            };
-
-            var requestBody = new
-            {
-                model = conf.OllamaModel,
-                messages = new[] { new { role = "user", content = prompt } },
-                stream = false,
-                temperature = conf.Temperature,
-                max_tokens = conf.MaxTokens,
-                response_format = jsonSchema
-            };
-
-            var jsonBody = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
-            });
-            var httpContent = new StringContent(jsonBody, Encoding.UTF8, "application/json");
-
-            try
-            {
-                var resp = await httpClient.PostAsync($"{conf.OllamaUrl}/v1/chat/completions", httpContent);
-                resp.EnsureSuccessStatusCode();
-                var responseJson = await resp.Content.ReadAsStringAsync();
-                using var doc = JsonDocument.Parse(responseJson);
-                var rawContent = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
-
-                Console.WriteLine($"\n[Ollama 原始响应] {responseJson}");
-
-                var cleanJson = ExtractJson(rawContent);
-                var indexResult = ParseClassificationByIndex(cleanJson);
-
-                var usage = new UsageInfo();
-                if (doc.RootElement.TryGetProperty("usage", out var usageElem))
-                {
-                    if (usageElem.TryGetProperty("prompt_tokens", out var pt)) usage.PromptTokens = pt.GetInt32();
-                    if (usageElem.TryGetProperty("completion_tokens", out var ct)) usage.CompletionTokens = ct.GetInt32();
-                    if (usageElem.TryGetProperty("total_tokens", out var tt)) usage.TotalTokens = tt.GetInt32();
-                }
-                return new ClassificationResponse { Results = indexResult, Usage = usage };
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"\nOllama 调用失败: {ex.Message}");
-                return null;
-            }
-        }
-
-        static async Task<ClassificationResponse> ClassifyWithDeepSeek(string prompt, ClassificationConfig conf)
-        {
-            string apiKey = conf.DeepSeekApiKey;
-            if (string.IsNullOrEmpty(apiKey))
-                apiKey = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
-            if (string.IsNullOrEmpty(apiKey))
-            {
-                Console.WriteLine("DeepSeek API Key 未设置");
-                return null;
-            }
-
-            var requestBody = new
-            {
-                model = conf.DeepSeekModel,
-                messages = new[] { new { role = "user", content = prompt } },
-                temperature = conf.Temperature,
-                max_tokens = conf.MaxTokens,
-                response_format = new { type = "json_object" },
-                thinking = new { type = "disabled" }
-            };
-
-            var jsonBody = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
-            });
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.deepseek.com/v1/chat/completions");
-            req.Headers.Add("Authorization", $"Bearer {apiKey}");
-            req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
-
-            try
-            {
-                var resp = await httpClient.SendAsync(req);
-                resp.EnsureSuccessStatusCode();
-                var responseJson = await resp.Content.ReadAsStringAsync();
-
-                Console.WriteLine($"\n[DeepSeek 原始响应] {responseJson}");
-
-                using var doc = JsonDocument.Parse(responseJson);
-                var rawContent = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
-                var indexResult = ParseClassificationByIndex(ExtractJson(rawContent));
-
-                var usage = new UsageInfo();
-                if (doc.RootElement.TryGetProperty("usage", out var usageElem))
-                {
-                    if (usageElem.TryGetProperty("prompt_tokens", out var pt)) usage.PromptTokens = pt.GetInt32();
-                    if (usageElem.TryGetProperty("completion_tokens", out var ct)) usage.CompletionTokens = ct.GetInt32();
-                    if (usageElem.TryGetProperty("total_tokens", out var tt)) usage.TotalTokens = tt.GetInt32();
-                    if (usageElem.TryGetProperty("prompt_cache_hit_tokens", out var hit)) usage.PromptCacheHitTokens = hit.GetInt32();
-                    if (usageElem.TryGetProperty("prompt_cache_miss_tokens", out var miss)) usage.PromptCacheMissTokens = miss.GetInt32();
-                }
-                return new ClassificationResponse { Results = indexResult, Usage = usage };
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"DeepSeek 错误: {ex.Message}");
-                return null;
-            }
-        }
-
-        static string ExtractJson(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return raw;
-
-            var cleaned = Regex.Replace(raw, @"<[^>]*>", "").Trim();
-
-            var mdMatch = Regex.Match(cleaned, @"```(?:json)?\s*([\s\S]*?)\s*```", RegexOptions.IgnoreCase);
-            if (mdMatch.Success) cleaned = mdMatch.Groups[1].Value.Trim();
-
-            int start = cleaned.IndexOf('{');
-            if (start == -1) return cleaned;
-
-            int braceCount = 0;
-            bool inString = false, escaped = false;
-            for (int i = start; i < cleaned.Length; i++)
-            {
-                char c = cleaned[i];
-                if (inString)
-                {
-                    if (escaped) { escaped = false; continue; }
-                    if (c == '\\') { escaped = true; continue; }
-                    if (c == '"') inString = false;
-                }
-                else
-                {
-                    if (c == '"') inString = true;
-                    else if (c == '{') braceCount++;
-                    else if (c == '}')
-                    {
-                        braceCount--;
-                        if (braceCount == 0)
-                        {
-                            var jsonCandidate = cleaned.Substring(start, i - start + 1);
-                            jsonCandidate = jsonCandidate.TrimEnd(',', ' ', '\t', '\n', '\r', '`');
-                            if (!jsonCandidate.EndsWith("}"))
-                            {
-                                int lastBrace = jsonCandidate.LastIndexOf('}');
-                                if (lastBrace >= 0) jsonCandidate = jsonCandidate.Substring(0, lastBrace + 1);
-                            }
-                            return jsonCandidate;
-                        }
-                    }
-                }
-            }
-            return cleaned.Substring(start).TrimEnd(',', ' ', '\t', '\n', '\r', '`');
-        }
-
-        static Dictionary<string, string> ParseClassificationByIndex(string jsonContent)
-        {
-            if (string.IsNullOrWhiteSpace(jsonContent)) return null;
-
-            try
-            {
-                using var doc = JsonDocument.Parse(jsonContent);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("results", out var resultsArray) || resultsArray.ValueKind != JsonValueKind.Array)
-                    return null;
-
-                var dict = new Dictionary<string, string>();
-                foreach (var item in resultsArray.EnumerateArray())
-                {
-                    if (!item.TryGetProperty("i", out var iElem)) continue;
-                    string idx;
-                    if (iElem.ValueKind == JsonValueKind.Number)
-                        idx = iElem.GetInt32().ToString();
-                    else if (iElem.ValueKind == JsonValueKind.String)
-                        idx = iElem.GetString();
-                    else
-                        continue;
-
-                    if (!item.TryGetProperty("c", out var cElem) || cElem.ValueKind != JsonValueKind.String)
-                        continue;
-                    string cat = cElem.GetString();
-
-                    if (!string.IsNullOrEmpty(idx) && !string.IsNullOrEmpty(cat))
-                        dict[idx] = cat;
-                }
-                return dict.Count > 0 ? dict : null;
-            }
-            catch (JsonException)
-            {
-                return ParseClassificationByIndexFallback(jsonContent);
-            }
-        }
-
-        static Dictionary<string, string> ParseClassificationByIndexFallback(string jsonContent)
-        {
-            var dict = new Dictionary<string, string>();
-            var matches = Regex.Matches(jsonContent,
-                @"""i""\s*:\s*(?:(\d+)|""(\d+)"")\s*,\s*""c""\s*:\s*""([^""]*)""");
-            foreach (Match m in matches)
-            {
-                string idx = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
-                string cat = m.Groups[3].Value;
-                if (!string.IsNullOrEmpty(idx))
-                    dict[idx] = cat;
-            }
-            return dict.Count > 0 ? dict : null;
-        }
-
-        // ==================== 新增：预分类方法 ====================
-        static Dictionary<string, string> PreClassify(List<VideoItem> items, ClassificationConfig conf)
+        // ==================== 预分类方法（冲突检测版） ====================
+        static (Dictionary<string, string> preResults, int conflicts, int unmatched) PreClassify(List<VideoItem> items, ClassificationConfig conf)
         {
             var result = new Dictionary<string, string>();
             var rules = conf.PreClassifyRules;
             if (rules == null || rules.Count == 0)
-                return result;
+                return (result, 0, items.Count);
 
-            // 用于统计每个规则命中数
-            var ruleHitCount = new Dictionary<string, int>();
-            foreach (var rule in rules)
-                ruleHitCount[rule.Key] = 0;
-
+            int conflictCount = 0;
             int unmatchedCount = 0;
-            const int maxUnmatchedDisplay = 5; // 只显示前5个未匹配的视频详情
+
+            // 用于调试输出冲突和未命中视频的详情（仅输出前几个）
+            int maxDisplay = 5;
+            int displayedConflict = 0, displayedUnmatched = 0;
 
             foreach (var item in items)
             {
-                bool matched = false;
+                // 统计该视频匹配的所有类别
+                var matchedCategories = new List<string>();
+
                 foreach (var rule in rules)
                 {
                     string category = rule.Key;
@@ -1148,45 +1152,47 @@ namespace VideoTagProcessor
                         fieldMatches[field] = fieldHit;
                     }
 
+                    bool matched;
                     if (requireAll)
-                    {
                         matched = fields.All(f => fieldMatches.TryGetValue(f, out bool hit) && hit);
-                    }
                     else
-                    {
                         matched = fields.Any(f => fieldMatches.TryGetValue(f, out bool hit) && hit);
-                    }
 
                     if (matched)
-                    {
-                        result[item.Bvid] = category;
-                        ruleHitCount[category] = ruleHitCount[category] + 1;
-                        break;
-                    }
+                        matchedCategories.Add(category);
                 }
 
-                if (!matched)
+                // 根据匹配数量决定是否预分类
+                if (matchedCategories.Count == 0)
                 {
                     unmatchedCount++;
-                    if (unmatchedCount <= maxUnmatchedDisplay)
+                    if (displayedUnmatched < maxDisplay)
                     {
-                        Console.WriteLine($"未匹配视频: Bvid={item.Bvid}, Title={item.Title}, TagName={item.TagName}, DetailTags={(item.DetailTags != null ? string.Join(",", item.DetailTags.Select(t => t.TagName)) : "null")}");
+                        Console.WriteLine($"未匹配: Bvid={item.Bvid}, Title={item.Title}, TagName={item.TagName}, DetailTags={(item.DetailTags != null ? string.Join(",", item.DetailTags.Select(t => t.TagName)) : "null")}");
+                        displayedUnmatched++;
+                    }
+                }
+                else if (matchedCategories.Count == 1)
+                {
+                    result[item.Bvid] = matchedCategories[0];
+                }
+                else // >=2
+                {
+                    conflictCount++;
+                    if (displayedConflict < maxDisplay)
+                    {
+                        Console.WriteLine($"冲突 (匹配{matchedCategories.Count}个规则): Bvid={item.Bvid}, 匹配类别={string.Join(",", matchedCategories)}");
+                        displayedConflict++;
                     }
                 }
             }
 
-            // 输出每个规则的命中数
-            Console.WriteLine("预分类规则命中统计：");
-            foreach (var kv in ruleHitCount)
-            {
-                Console.WriteLine($"  {kv.Key}: {kv.Value} 个视频");
-            }
-            if (unmatchedCount > maxUnmatchedDisplay)
-            {
-                Console.WriteLine($"... 还有 {unmatchedCount - maxUnmatchedDisplay} 个未匹配视频（未显示详情）");
-            }
+            if (unmatchedCount > maxDisplay)
+                Console.WriteLine($"... 还有 {unmatchedCount - maxDisplay} 个未匹配视频未显示");
+            if (conflictCount > maxDisplay)
+                Console.WriteLine($"... 还有 {conflictCount - maxDisplay} 个冲突视频未显示");
 
-            return result;
+            return (result, conflictCount, unmatchedCount);
         }
     }
 }
