@@ -296,6 +296,14 @@ public static class Classifier
         if (!categories.Contains("其他")) categories.Add("其他");
 
         var prompt = new StringBuilder();
+
+        // ===== 插入额外提示词（如果非空） =====
+        if (!string.IsNullOrWhiteSpace(conf.ExtraPrompt))
+        {
+            prompt.AppendLine(conf.ExtraPrompt.Trim());
+            prompt.AppendLine(); // 增加空行分隔
+        }
+
         var categoriesStr = string.Join("、", categories);
         prompt.AppendLine("你是一个专业的视频内容分类专家，擅长根据标签和元数据将视频精准归类。");
         prompt.AppendLine($"!!!严格按标签将每个视频归入以下类别之一：{categoriesStr}。");
