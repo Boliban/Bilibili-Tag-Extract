@@ -30,12 +30,12 @@
     "deepseek_api_key": "",
     "deepseek_model": "deepseek-v4-flash",
     "temperature": 0.1,
-    "max_tokens": 2048,
     "max_concurrency": 1,
     "batch_size": 10,
     "EnableWarmup": true,
     "WarmupWaitSeconds": 3,
     "categories": [ "科技", "生活", "游戏", "音乐", "动物", "搞笑", "影视", "知识", "其他" ],
+    "enable_pre_classify": true,
     "pre_classify_rules": {
       "游戏": {
         "keywords": [ "游戏", "单机", "FPS", "射击", "联机" ],

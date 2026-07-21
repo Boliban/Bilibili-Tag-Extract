@@ -82,7 +82,8 @@ namespace VideoTagProcessor
         public bool EnableWarmup { get; set; } = true;
         public int WarmupWaitSeconds { get; set; } = 3;
 
-        // 预分类开关
+        // 新增预分类开关（添加特性）
+        [JsonPropertyName("enable_pre_classify")]
         public bool EnablePreClassify { get; set; } = true;
 
         [JsonPropertyName("pre_classify_rules")]
@@ -92,7 +93,10 @@ namespace VideoTagProcessor
     public class PreClassifyRule
     {
         public List<string> Keywords { get; set; } = new();
-        public List<string> Fields { get; set; } = new(); // 为空则默认全部
+        public List<string> Fields { get; set; } = new();
+
+        // 添加特性以正确映射 JSON 中的 require_all_fields
+        [JsonPropertyName("require_all_fields")]
         public bool RequireAllFields { get; set; } = false;
     }
 
@@ -728,7 +732,11 @@ namespace VideoTagProcessor
                 for (int i = 0; i < batch.Count; i++)
                 {
                     string key = (i + 1).ToString();
-                    result[batch[i].Bvid] = response.Results.TryGetValue(key, out var cat) ? cat : "未知";
+                    string cat = response.Results.TryGetValue(key, out var c) ? c : "未知";
+                    // 强制校验类别是否在预期列表中，否则替换为“其他”
+                    if (!categories.Contains(cat))
+                        cat = "其他";
+                    result[batch[i].Bvid] = cat;
                 }
                 return new ClassificationResponse { Results = result, Usage = response.Usage };
             }
@@ -778,7 +786,6 @@ namespace VideoTagProcessor
                     messages = new[] { new { role = "user", content = prompt } },
                     stream = false,
                     temperature = conf.Temperature,
-                    max_tokens = conf.MaxTokens,
                     response_format = jsonSchema
                 };
 
@@ -833,7 +840,6 @@ namespace VideoTagProcessor
                     model = conf.DeepSeekModel,
                     messages = new[] { new { role = "user", content = prompt } },
                     temperature = conf.Temperature,
-                    max_tokens = conf.MaxTokens,
                     response_format = new { type = "json_object" },
                     thinking = new { type = "disabled" }
                 };
